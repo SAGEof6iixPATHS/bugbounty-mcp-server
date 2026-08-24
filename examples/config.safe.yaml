@@ -1,0 +1,31 @@
+safe_mode: true
+allowed_targets:
+  - example.com
+  - "*.example.com"
+blocked_targets:
+  - admin.example.com
+allow_private_targets: false
+requests_per_second: 2
+tool_timeout: 300
+max_tool_output_chars: 200000
+scanning:
+  max_ports_per_scan: 100
+  max_concurrency: 10
+  connect_timeout: 2
+  request_timeout: 15
+  max_response_bytes: 1000000
+  max_redirects: 3
+  max_crawl_depth: 2
+  max_pages_to_crawl: 20
+  max_links_per_page: 500
+  max_forms_per_page: 100
+  max_directory_requests: 50
+output:
+  data_dir: data
+  output_dir: output
+  max_evidence_bytes: 500000
+tools:
+  enable_nuclei: false
+  nuclei_path: nuclei
+http:
+  bearer_token: null

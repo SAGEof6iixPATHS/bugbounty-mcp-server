@@ -26,6 +26,7 @@ Safe mode defaults to enabled and fails closed:
 - URLs containing credentials and non-HTTP schemes are rejected.
 - Redirect destinations are rechecked before use.
 - Public hostnames that resolve to non-public addresses are rejected by default.
+- The validated numeric DNS answers are used for the actual HTTP, TCP, and TLS connection.
 
 Disabling safe mode is intended only for a separately isolated, explicitly authorized lab.
 
@@ -43,16 +44,17 @@ Network content, redirects, certificates, DNS records, headers, and Nuclei outpu
 Response bodies are bounded and not returned by `http_probe`. HTML is parsed for inventory only and
 is never rendered by the server. Report HTML escapes finding content.
 
-DNS is checked immediately before an HTTP request, but the HTTP library performs its own resolution.
-That leaves a small DNS-rebinding time-of-check/time-of-use window. Run the server with egress network
-policy that blocks metadata services, loopback, link-local, and internal ranges unless those ranges
-are the explicit assessment scope.
+HTTP uses a validating connector that hands the checked numeric answers directly to the transport.
+TCP and TLS tools likewise connect to the checked numeric answer while retaining the authorized
+hostname for HTTP routing and TLS SNI. Egress network policy remains recommended as independent
+defense in depth.
 
 ### Local filesystem
 
 MCP callers cannot choose report or finding-store paths. The configured `DATA_DIR`, `OUTPUT_DIR`, and
 optional operator-configured directory wordlist are trusted configuration. JSON finding updates use a
-sibling temporary file and atomic replacement.
+sibling temporary file and atomic replacement. Finding and evidence files are owner-readable only;
+evidence is size bounded and verified against its stored SHA-256 digest when read.
 
 The store is designed for one server process. Multiple writers on a shared directory need an external
 transactional datastore.
@@ -67,6 +69,8 @@ Nuclei is disabled by default. When enabled:
 - Stdin is closed.
 - Runtime and captured output are bounded.
 - The process group is killed on timeout.
+- Redirects, update checks, interaction services, dangerous template tags, and stdin are disabled.
+- Rate, concurrency, response-size, and local-network restrictions are passed explicitly.
 
 Installed templates remain part of the trust boundary. Review and pin them according to your program's
 rules and traffic limits.
@@ -77,8 +81,10 @@ Stdio is the recommended local transport. The server reserves stdout exclusively
 messages and sends logs to stderr.
 
 Streamable HTTP binds to loopback by default. The CLI refuses non-loopback binding without an explicit
-`--allow-remote` acknowledgement. The server does not implement user authentication. For remote
-deployment, require all of the following:
+`--allow-remote` acknowledgement. `HTTP_BEARER_TOKEN` enables constant-time pre-shared bearer
+authentication and defensive no-store/content-sniffing response headers. A bearer token is a
+single-principal deployment control, not a multi-user authorization system. For remote deployment,
+require all of the following:
 
 - Authenticated TLS termination.
 - Network allow-listing or a private network.

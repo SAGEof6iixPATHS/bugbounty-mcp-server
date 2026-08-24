@@ -20,6 +20,8 @@ This creates `.venv` and installs the project. Pass `--dev` to install developme
 ```bash
 ./run.sh validate-config
 ./run.sh list-tools
+./run.sh list-resources
+./run.sh list-prompts
 ./run.sh serve
 ```
 

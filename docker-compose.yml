@@ -2,7 +2,7 @@ services:
   bugbounty-mcp:
     build:
       context: .
-    image: bugbounty-mcp:2.0.0
+    image: bugbounty-mcp:2.1.0
     command:
       - serve
       - --transport
@@ -31,7 +31,11 @@ services:
       MAX_REDIRECTS: ${MAX_REDIRECTS:-5}
       MAX_CRAWL_DEPTH: ${MAX_CRAWL_DEPTH:-2}
       MAX_PAGES_TO_CRAWL: ${MAX_PAGES_TO_CRAWL:-30}
+      MAX_LINKS_PER_PAGE: ${MAX_LINKS_PER_PAGE:-1000}
+      MAX_FORMS_PER_PAGE: ${MAX_FORMS_PER_PAGE:-200}
       MAX_DIRECTORY_REQUESTS: ${MAX_DIRECTORY_REQUESTS:-100}
+      MAX_EVIDENCE_BYTES: ${MAX_EVIDENCE_BYTES:-500000}
+      HTTP_BEARER_TOKEN: ${HTTP_BEARER_TOKEN:-}
       ENABLE_NUCLEI: "false"
       DATA_DIR: /app/data
       OUTPUT_DIR: /app/output

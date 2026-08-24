@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 def _parse_bool(value: str) -> bool:
@@ -87,6 +87,8 @@ class ScanConfig(BaseModel):
     max_redirects: int = Field(default=5, ge=0, le=10)
     max_crawl_depth: int = Field(default=2, ge=0, le=5)
     max_pages_to_crawl: int = Field(default=30, ge=1, le=200)
+    max_links_per_page: int = Field(default=1000, ge=1, le=10000)
+    max_forms_per_page: int = Field(default=200, ge=1, le=2000)
     max_directory_requests: int = Field(default=100, ge=1, le=1000)
     directory_wordlist: Path | None = None
 
@@ -107,6 +109,29 @@ class OutputConfig(BaseModel):
 
     output_dir: Path = Path("output")
     data_dir: Path = Path("data")
+    max_evidence_bytes: int = Field(default=500_000, ge=1024, le=10_000_000)
+
+
+class HTTPConfig(BaseModel):
+    """Streamable HTTP transport security settings."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    bearer_token: SecretStr | None = None
+
+    @field_validator("bearer_token")
+    @classmethod
+    def validate_bearer_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if len(token) < 24:
+            raise ValueError("HTTP bearer token must contain at least 24 characters")
+        if not token.isascii() or any(
+            character.isspace() or ord(character) < 33 for character in token
+        ):
+            raise ValueError("HTTP bearer token must contain printable ASCII without whitespace")
+        return value
 
 
 class BugBountyConfig(BaseModel):
@@ -126,10 +151,11 @@ class BugBountyConfig(BaseModel):
     requests_per_second: float = Field(default=5.0, gt=0, le=100)
     tool_timeout: float = Field(default=300.0, gt=0, le=3600)
     max_tool_output_chars: int = Field(default=200_000, ge=1000, le=2_000_000)
-    user_agent: str = "bugbounty-mcp-server/2.0 (+authorized-security-testing)"
+    user_agent: str = "bugbounty-mcp-server/2.1 (+authorized-security-testing)"
     tools: ToolConfig = Field(default_factory=ToolConfig)
     scanning: ScanConfig = Field(default_factory=ScanConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    http: HTTPConfig = Field(default_factory=HTTPConfig)
 
     @field_validator("log_level")
     @classmethod
@@ -190,6 +216,8 @@ class BugBountyConfig(BaseModel):
             "USER_AGENT": (("user_agent",), str),
             "OUTPUT_DIR": (("output", "output_dir"), Path),
             "DATA_DIR": (("output", "data_dir"), Path),
+            "MAX_EVIDENCE_BYTES": (("output", "max_evidence_bytes"), int),
+            "HTTP_BEARER_TOKEN": (("http", "bearer_token"), SecretStr),
             "NUCLEI_PATH": (("tools", "nuclei_path"), str),
             "ENABLE_NUCLEI": (("tools", "enable_nuclei"), _parse_bool),
             "DEFAULT_PORTS": (
@@ -204,6 +232,8 @@ class BugBountyConfig(BaseModel):
             "MAX_REDIRECTS": (("scanning", "max_redirects"), int),
             "MAX_CRAWL_DEPTH": (("scanning", "max_crawl_depth"), int),
             "MAX_PAGES_TO_CRAWL": (("scanning", "max_pages_to_crawl"), int),
+            "MAX_LINKS_PER_PAGE": (("scanning", "max_links_per_page"), int),
+            "MAX_FORMS_PER_PAGE": (("scanning", "max_forms_per_page"), int),
             "MAX_DIRECTORY_REQUESTS": (("scanning", "max_directory_requests"), int),
             "DIRECTORY_WORDLIST": (("scanning", "directory_wordlist"), Path),
         }

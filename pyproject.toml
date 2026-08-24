@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bugbounty-mcp-server"
-version = "2.0.0"
+version = "2.1.0"
 description = "Scope-safe Model Context Protocol server for authorized bug bounty reconnaissance, scanning, and reporting"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,13 +20,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Typing :: Typed",
 ]
 dependencies = [
     "aiohttp>=3.10,<4",
     "click>=8.1,<9",
-    "cryptography>=42,<47",
+    "cryptography>=50,<51",
     "dnspython>=2.6,<3",
     "jsonschema>=4.23,<5",
     "mcp>=2.0,<3",
@@ -40,11 +41,12 @@ dependencies = [
 dev = [
     "build>=1.2,<2",
     "mypy>=1.15,<2",
-    "pytest>=8.3,<9",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=0.25,<2",
     "pytest-cov>=6,<8",
     "ruff>=0.11,<1",
     "twine>=6,<7",
+    "pip-audit>=2.9,<3",
     "types-jsonschema>=4.23,<5",
     "types-PyYAML>=6.0,<7",
 ]
@@ -77,7 +79,7 @@ source = ["bugbounty_mcp_server"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-fail_under = 80
+fail_under = 83
 
 [tool.ruff]
 line-length = 100

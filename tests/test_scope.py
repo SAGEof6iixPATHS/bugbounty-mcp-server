@@ -96,6 +96,9 @@ async def test_network_safety_accepts_public_dns_and_rejects_private_answers(mon
     )
     parsed = await policy.require_network_safe("https://example.com")
     assert parsed.host == "example.com"
+    resolved, addresses = await policy.resolve_network_safe("https://example.com")
+    assert resolved.host == "example.com"
+    assert addresses == ("93.184.216.34",)
 
     monkeypatch.setattr(
         "bugbounty_mcp_server.scope.socket.getaddrinfo",

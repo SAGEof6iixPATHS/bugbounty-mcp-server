@@ -8,7 +8,7 @@ import pytest
 
 import bugbounty_mcp_server.tools.core as core
 from bugbounty_mcp_server.config import BugBountyConfig
-from bugbounty_mcp_server.scope import parse_target
+from bugbounty_mcp_server.scope import ScopeViolation, parse_target
 from bugbounty_mcp_server.tools import SecurityTools, ToolExecutionError
 
 
@@ -62,7 +62,15 @@ async def test_subdomain_enumeration_parses_ct_and_active_dns(tmp_path, monkeypa
     async def authorize(value: str, **_kwargs):
         return parse_target(value)
 
+    async def resolve(value: str, **_kwargs):
+        parsed = parse_target(value)
+        addresses = ("203.0.113.20",) if parsed.host.startswith("www.") else ()
+        if not addresses:
+            raise ScopeViolation("not found")
+        return parsed, addresses
+
     tools.scope.require_network_safe = authorize
+    tools.scope.resolve_network_safe = resolve
 
     payload = json.dumps(
         [
@@ -99,12 +107,6 @@ async def test_subdomain_enumeration_parses_ct_and_active_dns(tmp_path, monkeypa
             return Response()
 
     monkeypatch.setattr(core.aiohttp, "ClientSession", Session)
-    monkeypatch.setattr(
-        core.socket,
-        "gethostbyname_ex",
-        lambda host: (host, [], ["203.0.113.20"]) if host.startswith("www.") else (host, [], []),
-    )
-
     result = await tools.subdomain_enumeration(
         "example.com",
         active=True,
@@ -180,7 +182,8 @@ async def test_nuclei_success_failure_and_health(tmp_path, monkeypatch) -> None:
         "stdout_truncated": False,
         "stderr_truncated": False,
     }
-    monkeypatch.setattr(core, "run_command_async", AsyncMock(return_value=success))
+    command_runner = AsyncMock(return_value=success)
+    monkeypatch.setattr(core, "run_command_async", command_runner)
 
     result = await tools.nuclei_scan("example.com", severity=["low"], tags=["headers"])
     health = await tools.server_health()
@@ -188,6 +191,11 @@ async def test_nuclei_success_failure_and_health(tmp_path, monkeypatch) -> None:
     assert result["finding_count"] == 1
     assert result["by_severity"] == {"low": 1}
     assert health["nuclei"] == {"enabled": True, "available": True}
+    command = command_runner.await_args.args[0]
+    assert "-restrict-local-network-access" in command
+    assert "-no-interactsh" in command
+    assert "-disable-redirects" in command
+    assert command[command.index("-rate-limit") + 1] == "100"
 
     failure = {**success, "success": False, "stdout": "", "stderr": "bad templates"}
     monkeypatch.setattr(core, "run_command_async", AsyncMock(return_value=failure))

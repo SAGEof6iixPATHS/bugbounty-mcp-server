@@ -24,11 +24,11 @@ async def test_in_process_mcp_list_and_call_round_trip(tmp_path) -> None:
         result = await client.call_tool("scope_check", {"target": "example.com"})
         health = await client.call_tool("server_health", {})
 
-    assert len(listed.tools) == 18
+    assert len(listed.tools) == 24
     assert result.is_error is False
     assert result.structured_content["allowed"] is True
     assert health.structured_content["status"] == "ok"
-    assert health.structured_content["tools"] == 18
+    assert health.structured_content["tools"] == 24
 
 
 @pytest.mark.asyncio

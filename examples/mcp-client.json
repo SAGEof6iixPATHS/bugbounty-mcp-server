@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "bugbounty": {
+      "command": "/absolute/path/bugbounty-mcp-server/.venv/bin/bugbounty-mcp",
+      "args": ["--config", "/absolute/path/config.safe.yaml", "serve"],
+      "env": {
+        "SAFE_MODE": "true",
+        "ALLOWED_TARGETS": "example.com,*.example.com"
+      }
+    }
+  }
+}

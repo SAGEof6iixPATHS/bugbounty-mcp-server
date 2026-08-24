@@ -217,9 +217,24 @@ class ScopePolicy:
 
     async def require_network_safe(self, target: str, *, require_url: bool = False) -> ParsedTarget:
         """Authorize a target and reject unexpected non-public DNS answers."""
+        parsed, _addresses = await self.resolve_network_safe(target, require_url=require_url)
+        return parsed
+
+    async def resolve_network_safe(
+        self,
+        target: str,
+        *,
+        require_url: bool = False,
+    ) -> tuple[ParsedTarget, tuple[str, ...]]:
+        """Authorize and resolve a target, returning the exact validated addresses.
+
+        Network callers should connect to one of the returned numeric addresses and
+        retain the original hostname for HTTP Host/TLS SNI. This closes the DNS
+        validation-to-connection gap that otherwise permits rebinding.
+        """
         parsed = self.require(target, require_url=require_url)
-        if parsed.kind == "ip" or self.config.allow_private_targets:
-            return parsed
+        if parsed.kind == "ip":
+            return parsed, (parsed.host,)
 
         loop = asyncio.get_running_loop()
         try:
@@ -230,7 +245,7 @@ class ScopePolicy:
         except socket.gaierror as exc:
             raise ScopeViolation(f"DNS resolution failed for {parsed.host}: {exc}") from exc
 
-        addresses = {str(record[4][0]) for record in records}
+        addresses = {ipaddress.ip_address(str(record[4][0])).compressed for record in records}
         if not addresses:
             raise ScopeViolation(f"DNS resolution returned no addresses for {parsed.host}")
         non_public = sorted(
@@ -238,9 +253,9 @@ class ScopePolicy:
             for address in addresses
             if _is_non_public_address(ipaddress.ip_address(address))
         )
-        if non_public:
+        if non_public and not self.config.allow_private_targets:
             raise ScopeViolation(
                 f"{parsed.host} resolves to disallowed non-public address(es): "
                 + ", ".join(non_public)
             )
-        return parsed
+        return parsed, tuple(sorted(addresses))

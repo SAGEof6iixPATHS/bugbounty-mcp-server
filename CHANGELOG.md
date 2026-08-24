@@ -2,6 +2,19 @@
 
 All notable changes are documented here.
 
+## 2.1.0 - 2026-08-24
+
+- Added six implemented tools for batch scope checks, email security, security.txt, OpenAPI
+  discovery, evidence attachment, and assessment summaries.
+- Added MCP-native resources, resource templates, prompts, and argument completions.
+- Added optional constant-time bearer authentication and defensive HTTP response headers.
+- Pinned validated DNS answers for HTTP, TCP, and TLS connections to close rebinding gaps.
+- Hardened Nuclei defaults and bounded subprocess output while it is being captured.
+- Added structured CWE/CVSS/confidence/impact fields, SHA-256 evidence integrity, and SARIF export.
+- Added runtime metrics, richer output schemas, Python 3.14 CI, dependency auditing, CodeQL, and
+  Dependabot.
+- Raised cryptography and pytest minimums to releases that address the current advisory set.
+
 ## 2.0.0 - 2026-08-24
 
 ### Added

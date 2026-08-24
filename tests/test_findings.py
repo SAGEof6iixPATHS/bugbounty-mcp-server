@@ -32,6 +32,7 @@ async def test_finding_lifecycle_and_reports_escape_untrusted_html(tmp_path) -> 
     json_report = await store.report(format="json", target="https://app.example.com")
     html_report = await store.report(format="html", target="https://app.example.com")
     markdown_report = await store.report(format="markdown")
+    sarif_report = await store.report(format="sarif")
 
     assert json.loads((tmp_path / "data" / "findings.json").read_text())[0]["id"] == created["id"]
     json_text = await asyncio.to_thread(
@@ -47,6 +48,57 @@ async def test_finding_lifecycle_and_reports_escape_untrusted_html(tmp_path) -> 
         encoding="utf-8",
     )
     assert markdown.startswith("# Security Assessment Report")
+    assert "<script>alert(1)</script>" not in markdown
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markdown
+    sarif_text = await asyncio.to_thread(
+        Path(sarif_report["path"]).read_text,
+        encoding="utf-8",
+    )
+    sarif = json.loads(sarif_text)
+    assert sarif["version"] == "2.1.0"
+    assert sarif["runs"][0]["results"][0]["level"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_structured_finding_evidence_and_integrity(tmp_path) -> None:
+    store = FindingStore(tmp_path / "data", tmp_path / "output", max_evidence_bytes=100)
+    finding = await store.create(
+        title="Broken object authorization",
+        severity="high",
+        target="https://example.com/users/2",
+        description="Another account is readable.",
+        impact="Account data disclosure.",
+        steps_to_reproduce=["Sign in", "Request user 2"],
+        cwe="CWE-639",
+        cvss_score=8.1,
+        confidence="confirmed",
+        tags=["API", "authorization"],
+        source_tool="manual-validation",
+    )
+    artifact = await store.add_evidence(
+        finding["id"],
+        label="redacted response",
+        content='{"owner":"other"}',
+        media_type="application/json",
+    )
+
+    metadata, content = await store.read_evidence(artifact["id"])
+    loaded = await store.get(finding["id"])
+    summary = await store.summary()
+
+    assert content == '{"owner":"other"}'
+    assert metadata["sha256"] == loaded["evidence_artifacts"][0]["sha256"]
+    assert loaded["fingerprint"]
+    assert loaded["tags"] == ["api", "authorization"]
+    assert summary["by_severity"]["high"] == 1
+    assert (tmp_path / "data" / metadata["path"]).stat().st_mode & 0o777 == 0o600
+
+    (tmp_path / "data" / metadata["path"]).write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity"):
+        await store.read_evidence(artifact["id"])
+
+    with pytest.raises(ValueError, match="byte limit"):
+        await store.add_evidence(finding["id"], label="large", content="x" * 101)
 
 
 @pytest.mark.asyncio
@@ -71,3 +123,21 @@ async def test_corrupt_store_is_reported(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="unreadable"):
         await store.list()
+
+
+@pytest.mark.asyncio
+async def test_evidence_index_cannot_escape_evidence_directory(tmp_path) -> None:
+    store = FindingStore(tmp_path / "data", tmp_path / "output")
+    finding = await store.create(
+        title="test",
+        severity="info",
+        target="example.com",
+        description="test",
+    )
+    artifact = await store.add_evidence(finding["id"], label="test", content="safe")
+    records = json.loads(store.path.read_text(encoding="utf-8"))
+    records[0]["evidence_artifacts"][0]["path"] = "../outside.txt"
+    store.path.write_text(json.dumps(records), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside the evidence directory"):
+        await store.read_evidence(artifact["id"])

@@ -5,14 +5,16 @@ authorized to test. Use `scope_check` before any network operation.
 
 ## Recommended assessment flow
 
-1. Confirm scope with `scope_check`.
-2. Gather passive data with `dns_enumeration` and `subdomain_enumeration`.
+1. Confirm one or many targets with `scope_check` or `batch_scope_check`.
+2. Gather passive data with `dns_enumeration`, `email_security_analysis`, and
+   `subdomain_enumeration`.
 3. Confirm exposed services with a bounded `port_scan`.
-4. Use `http_probe`, `ssl_scan`, `headers_analysis`, `cookie_security_analysis`, and `cors_scan`.
+4. Use `http_probe`, `ssl_scan`, `headers_analysis`, `cookie_security_analysis`, `cors_scan`,
+   `security_txt_analysis`, and `openapi_discovery`.
 5. Inventory same-host pages and paths with `web_crawler` and `web_directory_scan`.
 6. If the operator enabled it, use narrowly filtered `nuclei_scan` calls.
 7. Manually confirm suspected issues before calling `create_finding`.
-8. Track resolution and export a report.
+8. Attach redacted, hashed evidence, track resolution, and export HTML, Markdown, JSON, or SARIF.
 
 ## Example tool inputs
 
@@ -30,6 +32,15 @@ authorized to test. Use `scope_check` before any network operation.
   "record_types": ["A", "AAAA", "MX", "NS", "TXT", "CAA"]
 }
 ```
+
+### Email-domain security
+
+```json
+{"domain": "example.com"}
+```
+
+The result correlates MX, SPF, DMARC, MTA-STS, and SMTP TLS reporting records. DKIM is not guessed
+because selectors are deployment-specific.
 
 ### Certificate-transparency subdomains
 
@@ -110,6 +121,28 @@ depends on credential behavior and whether sensitive responses are readable cros
 The tool examines cookies created by the unauthenticated response. It does not accept or replay user
 credentials.
 
+### security.txt
+
+```json
+{"url": "https://example.com/"}
+```
+
+The tool checks the preferred `/.well-known/security.txt` and legacy `/security.txt` locations,
+validates required Contact/Expires metadata, and returns a content hash rather than an unbounded
+document body.
+
+### OpenAPI discovery
+
+```json
+{
+  "url": "https://api.example.com/",
+  "paths": ["/openapi.json", "/v3/api-docs"]
+}
+```
+
+Only bounded same-origin candidates are accepted. JSON and alias-free safe YAML are parsed; the
+result reports document metadata, path/operation counts, and SHA-256—not the full API definition.
+
 ### Crawl
 
 ```json
@@ -166,9 +199,25 @@ Create a confirmed finding:
   "severity": "low",
   "target": "https://example.com/login",
   "description": "The unauthenticated login response creates a session cookie without SameSite.",
-  "evidence": "Set-Cookie: session=...; Secure; HttpOnly",
+  "impact": "Cross-site request protections may be weaker than intended.",
+  "steps_to_reproduce": ["Request /login", "Inspect the Set-Cookie attributes"],
+  "cwe": "CWE-1275",
+  "cvss_score": 3.1,
+  "confidence": "confirmed",
+  "tags": ["session", "cookie"],
   "remediation": "Set SameSite=Lax or Strict where compatible.",
   "references": ["https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie"]
+}
+```
+
+Attach separately bounded evidence to the returned finding ID:
+
+```json
+{
+  "finding_id": "2a0a253a-39bd-4f1c-8ed5-bf747727f0f0",
+  "label": "redacted response headers",
+  "content": "Set-Cookie: session=[REDACTED]; Secure; HttpOnly",
+  "media_type": "text/plain"
 }
 ```
 
@@ -191,11 +240,18 @@ Update a finding:
 Generate a report:
 
 ```json
-{"report_format": "html", "target": "https://example.com/login"}
+{"report_format": "sarif", "target": "https://example.com/login"}
 ```
 
 Supported statuses are `open`, `triaged`, `accepted`, `resolved`, and `false_positive`. Supported
 severities are `critical`, `high`, `medium`, `low`, and `info`.
+
+## MCP resources and prompts
+
+Clients can discover bundled guidance and live state with `resources/list`, read finding/evidence
+URIs, and use prompts such as `assessment-plan`, `passive-recon`, `finding-triage`,
+`disclosure-draft`, and `remediation-validation`. See [docs/MCP_FEATURES.md](docs/MCP_FEATURES.md)
+for the complete catalog.
 
 ## CLI operations
 
@@ -205,6 +261,8 @@ bugbounty-mcp validate-config
 bugbounty-mcp validate-config --json
 bugbounty-mcp list-tools
 bugbounty-mcp list-tools --json
+bugbounty-mcp list-resources --json
+bugbounty-mcp list-prompts --json
 bugbounty-mcp export-config --format yaml --output config.yaml
 bugbounty-mcp serve
 ```

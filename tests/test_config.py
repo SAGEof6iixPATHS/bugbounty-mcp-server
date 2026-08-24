@@ -68,3 +68,17 @@ def test_directory_creation_is_explicit(tmp_path) -> None:
 
     assert config.output.data_dir.is_dir()
     assert config.output.output_dir.is_dir()
+
+
+def test_http_token_is_validated_and_never_serialized_in_plaintext(monkeypatch) -> None:
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "a-secure-token-with-24-chars")
+    config = BugBountyConfig.load(env_file=None)
+
+    assert config.http.bearer_token is not None
+    assert config.http.bearer_token.get_secret_value() == "a-secure-token-with-24-chars"
+    assert "a-secure-token" not in config.model_dump_json()
+
+    with pytest.raises(ValidationError, match="at least 24"):
+        BugBountyConfig(http={"bearer_token": "too-short"})
+    with pytest.raises(ValidationError, match="without whitespace"):
+        BugBountyConfig(http={"bearer_token": "a" * 24 + "\n"})

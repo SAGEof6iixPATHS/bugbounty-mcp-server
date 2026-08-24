@@ -5,7 +5,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 case "${1:-help}" in
     build)
-        exec docker build --tag bugbounty-mcp:2.0.0 .
+        exec docker build --tag bugbounty-mcp:2.1.0 .
         ;;
     up)
         exec docker compose up --build --detach

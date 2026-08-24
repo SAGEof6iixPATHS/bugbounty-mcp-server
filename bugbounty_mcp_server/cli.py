@@ -61,7 +61,7 @@ def cli(ctx: click.Context, config_path: Path | None, is_verbose: bool) -> None:
 @click.option(
     "--allow-remote",
     is_flag=True,
-    help="Acknowledge that an unauthenticated HTTP listener will bind beyond loopback.",
+    help="Acknowledge that the HTTP listener will bind beyond loopback.",
 )
 @click.pass_obj
 def serve(
@@ -91,14 +91,21 @@ def serve(
         if not is_loopback and not allow_remote:
             raise click.ClickException(
                 "refusing a non-loopback HTTP bind without --allow-remote; "
-                "this server does not implement user authentication"
+                "remote exposure requires explicit operator acknowledgement"
             )
         if not is_loopback:
-            click.echo(
-                "WARNING: exposing an unauthenticated security-testing server; "
-                "place it behind authenticated TLS and network policy.",
-                err=True,
-            )
+            if config.http.bearer_token is None:
+                click.echo(
+                    "WARNING: exposing an unauthenticated security-testing server; "
+                    "set HTTP_BEARER_TOKEN or place it behind authenticated TLS.",
+                    err=True,
+                )
+            else:
+                click.echo(
+                    "WARNING: bearer authentication is enabled, but TLS is still required "
+                    "outside a trusted local network.",
+                    err=True,
+                )
         asyncio.run(
             server.run_streamable_http(
                 host=host,
@@ -129,6 +136,7 @@ def _configuration_status(config: BugBountyConfig) -> dict[str, Any]:
         "allowed_target_count": len(config.allowed_targets),
         "blocked_target_count": len(config.blocked_targets),
         "private_targets_enabled": config.allow_private_targets,
+        "http_bearer_auth_enabled": config.http.bearer_token is not None,
         "storage": {
             "data_parent_exists": data_parent.exists(),
             "output_parent_exists": output_parent.exists(),
@@ -152,6 +160,10 @@ def validate_config(config: BugBountyConfig, as_json: bool) -> None:
     click.echo("Configuration is valid.")
     click.echo(f"Safe mode: {'enabled' if config.safe_mode else 'disabled'}")
     click.echo(f"Allowed targets: {len(config.allowed_targets)}")
+    click.echo(
+        "HTTP bearer authentication: "
+        + ("enabled" if status["http_bearer_auth_enabled"] else "disabled")
+    )
     if not status["scope_ready"]:
         click.echo("Network tools are fail-closed until ALLOWED_TARGETS is configured.")
     nuclei = status["optional_tools"]
@@ -183,6 +195,51 @@ def list_tools(config: BugBountyConfig, as_json: bool) -> None:
     click.echo(f"{len(definitions)} available tools:")
     for definition in definitions:
         click.echo(f"  {definition.name:<34} {definition.description}")
+
+
+@cli.command("list-resources")
+@click.option("--json", "as_json", is_flag=True, help="Emit MCP resources as JSON.")
+@click.pass_obj
+def list_resources(config: BugBountyConfig, as_json: bool) -> None:
+    """List static and current dynamic MCP resources."""
+    catalog = BugBountyMCPServer(config).catalog
+    resources = asyncio.run(catalog.list_resources())
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    resource.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for resource in resources
+                ],
+                indent=2,
+            )
+        )
+        return
+    click.echo(f"{len(resources)} available resources:")
+    for resource in resources:
+        click.echo(f"  {resource.uri!s:<46} {resource.title or resource.name}")
+
+
+@cli.command("list-prompts")
+@click.option("--json", "as_json", is_flag=True, help="Emit MCP prompts as JSON.")
+@click.pass_obj
+def list_prompts(config: BugBountyConfig, as_json: bool) -> None:
+    """List reusable MCP workflow prompts."""
+    prompts = BugBountyMCPServer(config).catalog.list_prompts()
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    prompt.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for prompt in prompts
+                ],
+                indent=2,
+            )
+        )
+        return
+    click.echo(f"{len(prompts)} available prompts:")
+    for prompt in prompts:
+        click.echo(f"  {prompt.name:<28} {prompt.description or ''}")
 
 
 @cli.command("export-config")

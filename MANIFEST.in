@@ -1,0 +1,15 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include USAGE.md
+include RUN_SCRIPT.md
+include env.example
+include Dockerfile
+include docker-compose.yml
+include docker-entrypoint.sh
+include docker.sh
+include install.sh
+include run.sh
+recursive-include docs *.md
+recursive-include examples *.json *.yaml
+recursive-include tests *.py

@@ -20,7 +20,7 @@ def test_help_validation_and_tool_listing() -> None:
     assert validation.exit_code == 0
     assert json.loads(validation.output)["scope_ready"] is False
     definitions = json.loads(listing.output)
-    assert len(definitions) == 18
+    assert len(definitions) == 24
     assert {item["name"] for item in definitions} >= {"scope_check", "port_scan"}
 
 
@@ -74,7 +74,25 @@ def test_human_readable_validation_and_listing() -> None:
     assert "Network tools are fail-closed" in validation.output
     assert "Nuclei:" in validation.output
     assert listing.exit_code == 0
-    assert "18 available tools" in listing.output
+    assert "24 available tools" in listing.output
+
+
+def test_resource_and_prompt_catalog_commands() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        resources = runner.invoke(cli, ["list-resources", "--json"])
+        prompts = runner.invoke(cli, ["list-prompts", "--json"])
+
+    assert resources.exit_code == 0
+    assert {item["uri"] for item in json.loads(resources.output)} >= {
+        "bugbounty://guides/getting-started",
+        "bugbounty://reference/tools",
+    }
+    assert prompts.exit_code == 0
+    assert {item["name"] for item in json.loads(prompts.output)} >= {
+        "assessment-plan",
+        "finding-triage",
+    }
 
 
 def test_acknowledged_remote_http_bind_runs_with_warning(monkeypatch) -> None:

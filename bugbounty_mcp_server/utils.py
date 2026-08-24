@@ -152,21 +152,45 @@ async def run_command_async(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+
+    async def read_bounded(stream: asyncio.StreamReader | None) -> tuple[bytes, bool]:
+        if stream is None:
+            return b"", False
+        captured = bytearray()
+        truncated = False
+        while chunk := await stream.read(65536):
+            remaining = max_output_bytes - len(captured)
+            if remaining > 0:
+                captured.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+        return bytes(captured), truncated
+
+    stdout_task = asyncio.create_task(read_bounded(process.stdout))
+    stderr_task = asyncio.create_task(read_bounded(process.stderr))
     timed_out = False
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        await asyncio.wait_for(process.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        stdout, stderr = await process.communicate()
+        await process.wait()
+    except asyncio.CancelledError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        await asyncio.gather(stdout_task, stderr_task)
+        raise
 
-    stdout_truncated = len(stdout) > max_output_bytes
-    stderr_truncated = len(stderr) > max_output_bytes
-    stdout = stdout[:max_output_bytes]
-    stderr = stderr[:max_output_bytes]
+    (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
+        stdout_task,
+        stderr_task,
+    )
     return {
         "returncode": -1 if timed_out else process.returncode,
         "stdout": stdout.decode("utf-8", errors="replace"),
@@ -197,13 +221,24 @@ async def bounded_map(
 
 def atomic_write_json(path: Path, value: Any) -> None:
     """Write JSON via a sibling temporary file and atomic replacement."""
+    atomic_write_text(
+        path,
+        json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
+    )
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    """Atomically write private UTF-8 text."""
+    atomic_write_bytes(path, value.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, value: bytes) -> None:
+    """Atomically write private bytes with owner-only permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
-            encoding="utf-8",
-        )
+        temporary.write_bytes(value)
+        temporary.chmod(0o600)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

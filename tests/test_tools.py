@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from bugbounty_mcp_server.config import BugBountyConfig
 from bugbounty_mcp_server.scope import ScopeViolation
@@ -120,14 +121,17 @@ def test_registry_has_unique_honest_schema_surface(tmp_path) -> None:
     definitions = tools.get_tools()
     names = [definition.name for definition in definitions]
 
-    assert len(names) == 18
+    assert len(names) == 24
     assert len(names) == len(set(names))
     assert "anti_forensics_techniques" not in names
     assert "server_health" in names
     assert all(
         definition.input_schema.get("additionalProperties") is False for definition in definitions
     )
-    assert all(definition.output_schema == {"type": "object"} for definition in definitions)
+    assert all(definition.output_schema.get("required") for definition in definitions)
+    for definition in definitions:
+        Draft202012Validator.check_schema(definition.input_schema)
+        Draft202012Validator.check_schema(definition.output_schema)
 
 
 @pytest.mark.asyncio
@@ -140,6 +144,8 @@ async def test_dispatch_validates_arguments_and_scope(tmp_path) -> None:
         await tools.call("scope_check", {})
     with pytest.raises(ToolExecutionError, match="Additional properties"):
         await tools.call("scope_check", {"target": "127.0.0.1", "extra": True})
+    with pytest.raises(ToolExecutionError, match="not a 'uuid'"):
+        await tools.call("update_finding", {"finding_id": "not-a-uuid", "status": "open"})
 
     result = await tools.call("scope_check", {"target": "127.0.0.1"})
     assert result["allowed"] is True
@@ -188,6 +194,9 @@ async def test_http_audits_crawl_and_directory_discovery(tmp_path) -> None:
     assert probe["status"] == 200
     assert probe["title"] == "Home"
     assert probe["content_sha256"]
+    assert "set-cookie" not in probe["headers"]
+    assert probe["redacted_header_names"] == ["set-cookie"]
+    assert probe["set_cookie_count"] == 1
     assert headers["score"] >= 70
     assert cookies["cookies"][0]["issues"] == []
     assert cors["findings"][0]["severity"] == "high"
@@ -231,6 +240,9 @@ async def test_local_redirect_body_limit_and_weak_controls(tmp_path) -> None:
         "missing HttpOnly",
         "missing SameSite",
     }
+
+    with pytest.raises(ValueError, match="absolute HTTP"):
+        await tools.cors_scan(f"{base}/", origins=["https://example.com/path"])
     assert {finding["severity"] for finding in cors["findings"]} == {"medium"}
 
 
