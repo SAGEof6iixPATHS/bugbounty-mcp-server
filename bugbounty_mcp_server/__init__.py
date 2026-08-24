@@ -1,15 +1,10 @@
-"""
-BugBounty MCP Server
+"""BugBounty MCP Server public package API."""
 
-A comprehensive Model Context Protocol server for bug bounty hunting 
-and web application penetration testing.
-"""
-
-__version__ = "1.0.0"
-__author__ = "Gokul"
+__version__ = "2.0.0"
+__author__ = "Gokul AP"
 __email__ = "apgokul008@gmail.com"
 
+from .config import BugBountyConfig
 from .server import BugBountyMCPServer
-from .tools import *
 
-__all__ = ["BugBountyMCPServer"]
+__all__ = ["BugBountyConfig", "BugBountyMCPServer", "__version__"]

@@ -1,366 +1,209 @@
-"""
-Utility functions for the BugBounty MCP Server.
-"""
+"""Small, reusable runtime utilities."""
+
+from __future__ import annotations
 
 import asyncio
-import logging
-import json
 import hashlib
-import time
+import json
+import logging
+import os
 import re
-import socket
-import ipaddress
-from typing import Any, Dict, List, Optional, Union, Callable, Awaitable
+import signal
+import sys
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
-import aiohttp
-import dns.resolver
-from datetime import datetime
+from typing import Any, TypeVar
+
+_T = TypeVar("_T")
+_SENSITIVE_KEYS = re.compile(
+    r"(authorization|cookie|credential|password|secret|token|api.?key)", re.I
+)
 
 
-def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
-    """Setup logging configuration."""
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Setup console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    
-    # Get root logger
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-    logger.addHandler(console_handler)
-    
-    # Add file handler if specified
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
+def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> None:
+    """Configure an idempotent stderr logger that cannot corrupt MCP stdio."""
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    managed_handlers = [
+        handler for handler in root.handlers if getattr(handler, "_bugbounty_managed", False)
+    ]
+    for handler in managed_handlers:
+        root.removeHandler(handler)
+        handler.close()
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    console._bugbounty_managed = True  # type: ignore[attr-defined]
+    root.addHandler(console)
+
+    if log_file is not None:
+        file_handler = logging.FileHandler(Path(log_file), encoding="utf-8")
         file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        file_handler._bugbounty_managed = True  # type: ignore[attr-defined]
+        root.addHandler(file_handler)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def stable_hash(value: str | bytes) -> str:
+    payload = value if isinstance(value, bytes) else value.encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def safe_filename(value: str, *, fallback: str = "result", max_length: int = 120) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return (normalized or fallback)[:max_length]
+
+
+def redact(value: Any) -> Any:
+    """Recursively redact credential-like fields before logging."""
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if _SENSITIVE_KEYS.search(str(key)) else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact(item) for item in value)
+    return value
 
 
 class RateLimiter:
-    """Simple rate limiter for API calls."""
-    
-    def __init__(self, calls_per_second: float = 1.0):
-        self.calls_per_second = calls_per_second
-        self.last_call = 0.0
-    
+    """Concurrency-safe, monotonic fixed-interval rate limiter."""
+
+    def __init__(self, calls_per_second: float):
+        if calls_per_second <= 0:
+            raise ValueError("calls_per_second must be positive")
+        self._interval = 1.0 / calls_per_second
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()
+
     async def wait(self) -> None:
-        """Wait for rate limit if necessary."""
-        now = time.time()
-        elapsed = now - self.last_call
-        min_interval = 1.0 / self.calls_per_second
-        
-        if elapsed < min_interval:
-            await asyncio.sleep(min_interval - elapsed)
-        
-        self.last_call = time.time()
+        async with self._lock:
+            now = time.monotonic()
+            delay = self._next_allowed - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+                now = time.monotonic()
+            self._next_allowed = max(now, self._next_allowed) + self._interval
 
 
-class Cache:
-    """Simple in-memory cache with TTL."""
-    
-    def __init__(self, ttl: int = 3600):
-        self.ttl = ttl
-        self.data: Dict[str, tuple] = {}  # key -> (value, timestamp)
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get value from cache."""
-        if key not in self.data:
-            return None
-        
-        value, timestamp = self.data[key]
-        if time.time() - timestamp > self.ttl:
-            del self.data[key]
-            return None
-        
-        return value
-    
-    def set(self, key: str, value: Any) -> None:
-        """Set value in cache."""
-        self.data[key] = (value, time.time())
-    
-    def clear(self) -> None:
-        """Clear all cached data."""
-        self.data.clear()
-
-
-def validate_target(target: str) -> Dict[str, Any]:
-    """Validate and parse a target (URL, domain, or IP)."""
-    result = {
-        "valid": False,
-        "type": None,
-        "original": target,
-        "parsed": None,
-        "domain": None,
-        "ip": None,
-        "port": None,
-        "scheme": None
-    }
-    
-    try:
-        # Try to parse as URL first
-        if "://" in target:
-            parsed = urlparse(target)
-            if parsed.netloc:
-                result["valid"] = True
-                result["type"] = "url"
-                result["parsed"] = parsed
-                result["domain"] = parsed.hostname
-                result["port"] = parsed.port
-                result["scheme"] = parsed.scheme
-                
-                # Try to resolve IP
-                try:
-                    result["ip"] = socket.gethostbyname(parsed.hostname)
-                except:
-                    pass
-                
-                return result
-        
-        # Try to parse as IP address
-        try:
-            ip_obj = ipaddress.ip_address(target)
-            result["valid"] = True
-            result["type"] = "ip"
-            result["ip"] = str(ip_obj)
-            return result
-        except ValueError:
-            pass
-        
-        # Try to parse as domain
-        if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$', target):
-            result["valid"] = True
-            result["type"] = "domain"
-            result["domain"] = target
-            
-            # Try to resolve IP
-            try:
-                result["ip"] = socket.gethostbyname(target)
-            except:
-                pass
-            
-            return result
-        
-        # Try to parse as domain:port
-        if ":" in target and not target.startswith("["):
-            parts = target.rsplit(":", 1)
-            if len(parts) == 2:
-                domain, port_str = parts
-                try:
-                    port = int(port_str)
-                    if 1 <= port <= 65535:
-                        if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$', domain):
-                            result["valid"] = True
-                            result["type"] = "domain_port"
-                            result["domain"] = domain
-                            result["port"] = port
-                            
-                            # Try to resolve IP
-                            try:
-                                result["ip"] = socket.gethostbyname(domain)
-                            except:
-                                pass
-                            
-                            return result
-                except ValueError:
-                    pass
-    
-    except Exception:
-        pass
-    
-    return result
-
-
-async def resolve_domain(domain: str) -> Dict[str, List[str]]:
-    """Resolve domain to various record types."""
-    results = {
-        "A": [],
-        "AAAA": [],
-        "CNAME": [],
-        "MX": [],
-        "NS": [],
-        "TXT": [],
-        "SOA": []
-    }
-    
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5
-    
-    for record_type in results.keys():
-        try:
-            answers = resolver.resolve(domain, record_type)
-            for answer in answers:
-                results[record_type].append(str(answer))
-        except Exception:
-            continue
-    
-    return results
-
-
-async def check_port_open(host: str, port: int, timeout: int = 5) -> bool:
-    """Check if a port is open on a host."""
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except Exception:
-        return False
-
-
-def extract_urls_from_text(text: str, base_url: Optional[str] = None) -> List[str]:
-    """Extract URLs from text content."""
-    url_pattern = re.compile(
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-    )
-    
-    urls = url_pattern.findall(text)
-    
-    # Also look for relative URLs if base_url is provided
-    if base_url:
-        relative_pattern = re.compile(r'(?:href|src)=["\']([^"\']+)["\']')
-        relative_urls = relative_pattern.findall(text)
-        
-        for rel_url in relative_urls:
-            if not rel_url.startswith(('http://', 'https://', 'javascript:', 'mailto:')):
-                full_url = urljoin(base_url, rel_url)
-                urls.append(full_url)
-    
-    return list(set(urls))
-
-
-def extract_subdomains_from_text(text: str, domain: str) -> List[str]:
-    """Extract subdomains for a specific domain from text."""
-    # Pattern to match subdomains
-    pattern = rf'\b[\w\.-]*\.{re.escape(domain)}\b'
-    matches = re.findall(pattern, text, re.IGNORECASE)
-    
-    # Filter out false positives and clean up
-    subdomains = []
-    for match in matches:
-        if match.endswith(f'.{domain}'):
-            subdomains.append(match.lower())
-    
-    return list(set(subdomains))
-
-
-def hash_content(content: str) -> str:
-    """Generate hash of content for caching/deduplication."""
-    return hashlib.md5(content.encode()).hexdigest()
-
-
-def format_bytes(bytes_count: int) -> str:
-    """Format bytes into human readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_count < 1024.0:
-            return f"{bytes_count:.2f} {unit}"
-        bytes_count /= 1024.0
-    return f"{bytes_count:.2f} PB"
-
-
-def format_duration(seconds: float) -> str:
-    """Format duration in seconds to human readable format."""
-    if seconds < 60:
-        return f"{seconds:.2f}s"
-    elif seconds < 3600:
-        minutes = seconds / 60
-        return f"{minutes:.1f}m"
+def parse_ports(specification: str | None, defaults: Iterable[int], maximum: int) -> list[int]:
+    """Parse comma-separated ports and inclusive ranges with a hard cap."""
+    if specification is None or not specification.strip():
+        ports = set(defaults)
     else:
-        hours = seconds / 3600
-        return f"{hours:.1f}h"
+        ports = set()
+        for raw_part in specification.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                bounds = part.split("-", 1)
+                try:
+                    start, end = int(bounds[0]), int(bounds[1])
+                except ValueError as exc:
+                    raise ValueError(f"invalid port range: {part!r}") from exc
+                if start > end:
+                    raise ValueError(f"port range starts after it ends: {part!r}")
+                if end - start + 1 > maximum:
+                    raise ValueError(f"port range exceeds the {maximum}-port limit")
+                ports.update(range(start, end + 1))
+            else:
+                try:
+                    ports.add(int(part))
+                except ValueError as exc:
+                    raise ValueError(f"invalid port: {part!r}") from exc
+            if len(ports) > maximum:
+                raise ValueError(f"scan exceeds the {maximum}-port limit")
+
+    if not ports:
+        raise ValueError("at least one port is required")
+    if any(port < 1 or port > 65535 for port in ports):
+        raise ValueError("ports must be between 1 and 65535")
+    if len(ports) > maximum:
+        raise ValueError(f"scan exceeds the {maximum}-port limit")
+    return sorted(ports)
 
 
-async def run_command_async(command: List[str], timeout: int = 30) -> Dict[str, Any]:
-    """Run a command asynchronously and return results."""
+async def run_command_async(
+    command: list[str],
+    *,
+    timeout: float = 30,
+    max_output_bytes: int = 5_000_000,
+) -> dict[str, Any]:
+    """Run an argv-only subprocess, kill its process group on timeout, and bound output."""
+    if not command or not command[0]:
+        raise ValueError("command cannot be empty")
+    if timeout <= 0 or max_output_bytes <= 0:
+        raise ValueError("timeout and max_output_bytes must be positive")
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=timeout
-        )
-        
-        return {
-            "returncode": process.returncode,
-            "stdout": stdout.decode('utf-8', errors='ignore'),
-            "stderr": stderr.decode('utf-8', errors='ignore'),
-            "success": process.returncode == 0
-        }
-    
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": "Command timed out",
-            "success": False
-        }
-    except Exception as e:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(e),
-            "success": False
-        }
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = await process.communicate()
+
+    stdout_truncated = len(stdout) > max_output_bytes
+    stderr_truncated = len(stderr) > max_output_bytes
+    stdout = stdout[:max_output_bytes]
+    stderr = stderr[:max_output_bytes]
+    return {
+        "returncode": -1 if timed_out else process.returncode,
+        "stdout": stdout.decode("utf-8", errors="replace"),
+        "stderr": stderr.decode("utf-8", errors="replace"),
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "timed_out": timed_out,
+        "success": not timed_out and process.returncode == 0,
+    }
 
 
-def safe_filename(filename: str) -> str:
-    """Make a filename safe for the filesystem."""
-    # Remove or replace unsafe characters
-    filename = re.sub(r'[^\w\-_.]', '_', filename)
-    # Remove consecutive underscores
-    filename = re.sub(r'_+', '_', filename)
-    # Limit length
-    return filename[:200]
+async def bounded_map(
+    items: Iterable[_T],
+    operation: Callable[[_T], Awaitable[Any]],
+    *,
+    concurrency: int,
+) -> list[Any]:
+    if concurrency < 1:
+        raise ValueError("concurrency must be positive")
+    semaphore = asyncio.Semaphore(concurrency)
 
-
-def load_wordlist(file_path: str) -> List[str]:
-    """Load wordlist from file."""
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            return [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    except FileNotFoundError:
-        return []
-
-
-def save_json_report(data: Dict[str, Any], file_path: str) -> bool:
-    """Save data as JSON report."""
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, default=str)
-        return True
-    except Exception:
-        return False
-
-
-def get_timestamp() -> str:
-    """Get current timestamp as string."""
-    return datetime.now().isoformat()
-
-
-async def batch_process(
-    items: List[Any], 
-    func: Callable[[Any], Awaitable[Any]], 
-    max_concurrent: int = 10
-) -> List[Any]:
-    """Process items in batches with concurrency limit."""
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def process_item(item):
+    async def run(item: _T) -> Any:
         async with semaphore:
-            return await func(item)
-    
-    tasks = [process_item(item) for item in items]
-    return await asyncio.gather(*tasks, return_exceptions=True)
+            return await operation(item)
+
+    return await asyncio.gather(*(run(item) for item in items))
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    """Write JSON via a sibling temporary file and atomic replacement."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

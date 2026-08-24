@@ -1,141 +1,154 @@
-"""
-Main MCP Server implementation for Bug Bounty hunting.
-"""
+"""Model Context Protocol server wiring."""
+
+from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
+from uuid import uuid4
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
+import uvicorn
+from mcp.server import Server, ServerRequestContext
+from mcp.server.stdio import stdio_server
 from mcp.types import (
-    CallToolRequest,
+    CallToolRequestParams,
     CallToolResult,
-    ListToolsRequest,
     ListToolsResult,
-    Tool,
+    PaginatedRequestParams,
     TextContent,
-    ImageContent,
-    EmbeddedResource,
 )
 
-from .tools import (
-    ReconTools,
-    ScanningTools,
-    VulnerabilityTools,
-    WebApplicationTools,
-    NetworkTools,
-    OSINTTools,
-    ExploitationTools,
-    ReportingTools,
-)
+from . import __version__
 from .config import BugBountyConfig
+from .tools import SecurityTools, ToolExecutionError
 from .utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
 class BugBountyMCPServer:
-    """Main MCP Server for Bug Bounty operations."""
+    """A scope-safe MCP server with exact schemas and structured results."""
 
-    def __init__(self, config: Optional[BugBountyConfig] = None):
-        self.config = config or BugBountyConfig()
-        self.server = Server("bugbounty-mcp-server")
-        
-        # Initialize tool categories
-        self.recon_tools = ReconTools(self.config)
-        self.scanning_tools = ScanningTools(self.config)
-        self.vuln_tools = VulnerabilityTools(self.config)
-        self.webapp_tools = WebApplicationTools(self.config)
-        self.network_tools = NetworkTools(self.config)
-        self.osint_tools = OSINTTools(self.config)
-        self.exploit_tools = ExploitationTools(self.config)
-        self.reporting_tools = ReportingTools(self.config)
-        
-        # Store all tool instances
-        self.tool_categories = [
-            self.recon_tools,
-            self.scanning_tools,
-            self.vuln_tools,
-            self.webapp_tools,
-            self.network_tools,
-            self.osint_tools,
-            self.exploit_tools,
-            self.reporting_tools,
-        ]
-        
-        self._setup_handlers()
+    def __init__(self, config: BugBountyConfig | None = None):
+        self.config = config or BugBountyConfig.load()
+        self.tools = SecurityTools(self.config)
+        self._started = False
+        self.server: Server[Any] = Server(
+            "bugbounty-mcp-server",
+            version=__version__,
+            instructions=(
+                "Use these tools only for systems the user is authorized to test. "
+                "Call scope_check before network activity, respect target boundaries, "
+                "and record confirmed results as findings. Tool errors are structured "
+                "so you can correct invalid arguments or scope configuration."
+            ),
+            on_list_tools=self._handle_list_tools,
+            on_call_tool=self._handle_call_tool,
+        )
 
-    def _setup_handlers(self) -> None:
-        """Setup MCP server handlers."""
-        
-        @self.server.list_tools()
-        async def handle_list_tools() -> List[Tool]:
-            """List all available tools."""
-            tools = []
-            for tool_category in self.tool_categories:
-                tools.extend(tool_category.get_tools())
-            return tools
+    async def _handle_list_tools(
+        self,
+        _context: ServerRequestContext[Any],
+        _params: PaginatedRequestParams | None,
+    ) -> ListToolsResult:
+        return ListToolsResult(tools=self.tools.get_tools())
 
-        @self.server.call_tool()
-        async def handle_call_tool(
-            name: str, arguments: Optional[Dict[str, Any]] = None
-        ) -> List[TextContent | ImageContent | EmbeddedResource]:
-            """Execute a tool."""
-            if arguments is None:
-                arguments = {}
+    async def _handle_call_tool(
+        self,
+        _context: ServerRequestContext[Any],
+        params: CallToolRequestParams,
+    ) -> CallToolResult:
+        logger.info("tool call started: %s", params.name)
+        try:
+            result = await asyncio.wait_for(
+                self.tools.call(params.name, params.arguments),
+                timeout=self.config.tool_timeout,
+            )
+        except ToolExecutionError as exc:
+            logger.warning("tool call rejected: %s (%s)", params.name, exc.code)
+            return self._error_result(exc.code, str(exc))
+        except asyncio.TimeoutError:
+            logger.warning("tool call timed out: %s", params.name)
+            return self._error_result(
+                "timeout",
+                f"tool exceeded the {self.config.tool_timeout:g}-second timeout",
+            )
+        except asyncio.CancelledError:
+            logger.info("tool call cancelled: %s", params.name)
+            raise
+        except Exception:
+            incident_id = str(uuid4())
+            logger.exception("unexpected tool failure: %s incident=%s", params.name, incident_id)
+            return self._error_result(
+                "internal_error",
+                f"unexpected server error; incident id: {incident_id}",
+            )
 
-            logger.info(f"Executing tool: {name} with args: {arguments}")
+        logger.info("tool call completed: %s", params.name)
+        text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        if len(text) > self.config.max_tool_output_chars:
+            return self._error_result(
+                "output_limit",
+                "tool result exceeded the configured output limit; narrow the request",
+            )
+        return CallToolResult(
+            content=[TextContent(type="text", text=text)],
+            structured_content=result,
+            is_error=False,
+        )
 
-            # Find the tool in one of our categories
-            for tool_category in self.tool_categories:
-                if hasattr(tool_category, name):
-                    tool_method = getattr(tool_category, name)
-                    try:
-                        result = await tool_method(**arguments)
-                        return [TextContent(type="text", text=str(result))]
-                    except Exception as e:
-                        error_msg = f"Error executing {name}: {str(e)}"
-                        logger.error(error_msg)
-                        return [TextContent(type="text", text=error_msg)]
-
-            return [TextContent(type="text", text=f"Tool '{name}' not found")]
+    @staticmethod
+    def _error_result(code: str, message: str) -> CallToolResult:
+        payload = {"error": {"code": code, "message": message}}
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+            structured_content=payload,
+            is_error=True,
+        )
 
     async def start(self) -> None:
-        """Start the MCP server."""
-        setup_logging(self.config.log_level)
-        logger.info("Starting BugBounty MCP Server...")
-        
-        # Initialize all tool categories
-        for tool_category in self.tool_categories:
-            await tool_category.initialize()
-        
-        logger.info("BugBounty MCP Server started successfully")
+        if self._started:
+            return
+        self.config.ensure_directories()
+        self._started = True
+        logger.info(
+            "BugBounty MCP Server %s initialized with %d tools", __version__, len(self.tools.specs)
+        )
 
     async def run_stdio(self) -> None:
-        """Run server with stdio transport."""
-        from mcp.server.stdio import stdio_server
-        
+        """Run one MCP connection over stdin/stdout."""
+        setup_logging(self.config.log_level)
         await self.start()
         async with stdio_server() as (read_stream, write_stream):
             await self.server.run(
                 read_stream,
                 write_stream,
-                InitializationOptions(
-                    server_name="bugbounty-mcp-server",
-                    server_version="1.0.0",
-                    capabilities={
-                        "tools": {
-                            "listChanged": False
-                        },
-                        "resources": {
-                            "subscribe": False,
-                            "listChanged": False
-                        },
-                        "prompts": {
-                            "listChanged": False
-                        }
-                    },
-                ),
+                self.server.create_initialization_options(),
             )
+
+    async def run_streamable_http(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        path: str = "/mcp",
+        stateless: bool = False,
+        json_response: bool = False,
+    ) -> None:
+        """Run the MCP Streamable HTTP transport with the SDK's security defaults."""
+        setup_logging(self.config.log_level)
+        await self.start()
+        application = self.server.streamable_http_app(
+            streamable_http_path=path,
+            stateless_http=stateless,
+            json_response=json_response,
+            host=host,
+        )
+        uvicorn_config = uvicorn.Config(
+            application,
+            host=host,
+            port=port,
+            log_level=self.config.log_level.lower(),
+        )
+        await uvicorn.Server(uvicorn_config).serve()

@@ -1,276 +1,51 @@
-# BugBounty MCP Server - .gitignore
-
-# Virtual Environments
-venv/
-env/
-ENV/
-.venv/
-.env/
-virtualenv/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.json
+config.yaml
+config.yml
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+.venv/
+venv/
+build/
+dist/
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
+# Tests and quality tools
 .coverage
 .coverage.*
-.cache
-nosetests.xml
 coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
+htmlcov/
 .pytest_cache/
-cover/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# poetry
-poetry.lock
-
-# pdm
-.pdm.toml
-
-# PEP 582
-__pypackages__/
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.env.local
-.env.production
-.env.staging
-.env.development
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# Security Scanner Cache
-cache/
-.cache/
-tmp/
-temp/
-
-# Logs
-logs/
-*.log
-log/
-
-# Output and Data Directories
-output/
+# Runtime data
 data/
-results/
-scans/
-reports/
-
-# Wordlists (usually downloaded separately)
+output/
+cache/
+logs/
 wordlists/
-*.txt
-*.lst
+*.log
+*.sqlite*
 
-# Screenshots and Images
-screenshots/
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.svg
-
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-
-# Configuration files with sensitive data
-config.yaml
-config.json
-.env.*
-!.env.example
-secrets.yaml
-secrets.json
-
-# API Keys and Tokens
-api_keys.txt
-tokens.txt
-credentials.txt
-
-# Tool-specific
+# External security tools
 .nuclei/
 .subfinder/
 .httpx/
-.gobuster/
 .ffuf/
-.nmap/
-.masscan/
 
-# Browser automation
-chromedriver*
-geckodriver*
-webdriver/
-
-# OS-specific
+# Editors and operating systems
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-Desktop.ini
-
-# Editor and IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-*.backup
-*.orig
-
-# Archive files
-*.zip
-*.tar.gz
-*.rar
-*.7z
-
-# SSL Certificates and Keys
-*.pem
-*.key
-*.crt
-*.csr
-*.p12
-*.pfx
-
-# Docker
-.dockerignore
-Dockerfile.local
-docker-compose.override.yml
-
-# Kubernetes
-*.kubeconfig
-
-# Terraform
-*.tfstate
-*.tfstate.backup
-.terraform/
-
-# AWS
-.aws/
-
-# Node.js (if any JavaScript tools are added)
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Coverage reports
-htmlcov/
-.coverage
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-
-# Profiling
-*.prof
-
-# Documentation build
-docs/_build/
-docs/.doctrees/
-
-# Local development
-local/
-dev/
-development/
-
-# Performance monitoring
-.monitoring/
-metrics/
-
-# Custom exclusions for this project
-custom_tools/
-private_tools/
-experimental/

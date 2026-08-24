@@ -1,155 +1,38 @@
-# BugBounty MCP Server Docker Image
-# Multi-stage build for optimized image size
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS runtime
 
-# Stage 1: Builder stage with all build dependencies
-FROM ubuntu:22.04 as builder
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DATA_DIR=/app/data \
+    OUTPUT_DIR=/app/output
 
-# Set environment variables for build
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+RUN groupadd --gid 10001 bugbounty \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/bugbounty bugbounty
 
-# Install build dependencies including Python
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Go for Go-based security tools
-ENV GO_VERSION=1.21.5
-# Detect architecture and install appropriate Go binary
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then GOARCH="amd64"; \
-    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then GOARCH="arm64"; \
-    else echo "Unsupported architecture: $ARCH" && exit 1; fi && \
-    curl -fsSL https://golang.org/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz | tar -C /usr/local -xzf -
-ENV PATH="/usr/local/go/bin:${PATH}"
-ENV GOPATH="/go"
-ENV PATH="${GOPATH}/bin:${PATH}"
-
-# Create Go workspace
-RUN mkdir -p ${GOPATH}/{src,bin,pkg}
-
-# Install Go-based security tools
-RUN go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest && \
-    go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
-    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
-    go install -v github.com/OJ/gobuster/v3@latest && \
-    go install -v github.com/ffuf/ffuf@latest
-
-# Create Python virtual environment and install dependencies
-WORKDIR /app
-COPY requirements.txt pyproject.toml ./
-RUN python3 -m venv /app/venv
-ENV PATH="/app/venv/bin:$PATH"
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Stage 2: Runtime stage with minimal dependencies
-FROM ubuntu:22.04
-
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PATH="/app/venv/bin:$PATH"
-ENV PATH="/go/bin:$PATH"
-
-# Create non-root user for security
-RUN groupadd -r bugbounty && useradd -r -g bugbounty -d /app -s /bin/bash bugbounty
-
-# Install runtime system dependencies and security tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Essential tools
-    curl \
-    wget \
-    git \
-    ca-certificates \
-    dnsutils \
-    netcat-traditional \
-    socat \
-    # Network scanning tools
-    nmap \
-    masscan \
-    # Web security tools
-    nikto \
-    dirb \
-    sqlmap \
-    # Additional utilities
-    whatweb \
-    whois \
-    # SSL tools
-    openssl \
-    # Browser automation (for Selenium/Playwright)
-    chromium-browser \
-    # Python runtime
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-distutils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy Go binaries from builder stage
-COPY --from=builder /go/bin/* /usr/local/bin/
-
-# Copy Python virtual environment from builder stage
-COPY --from=builder /app/venv /app/venv
-
-# Set working directory
 WORKDIR /app
 
-# Copy application code
-COPY . .
+COPY pyproject.toml README.md LICENSE ./
+COPY bugbounty_mcp_server ./bugbounty_mcp_server
+RUN python -m pip install --no-cache-dir .
 
-# Copy and set up entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
+RUN chmod 0755 /usr/local/bin/docker-entrypoint \
+    && mkdir -p /app/data /app/output \
+    && chown -R bugbounty:bugbounty /app/data /app/output
 
-# Install the application in the virtual environment
-RUN pip install --no-cache-dir -e .
+USER 10001:10001
 
-# Create necessary directories and set permissions
-RUN mkdir -p wordlists output data logs cache && \
-    chown -R bugbounty:bugbounty /app && \
-    chmod +x run.sh
-
-# Set up default environment file
-RUN cp env.example .env
-
-# Download wordlists using our enhanced download script
-# This uses the proper CLI command with error handling and progress feedback
-RUN ./run.sh download-wordlists --type all || true
-
-# Set correct permissions
-RUN chown -R bugbounty:bugbounty /app
-
-# Switch to non-root user
-USER bugbounty
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD bugbounty-mcp validate-config || exit 1
-
-# Expose port for MCP server
 EXPOSE 3001
 
-# Set entrypoint
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD bugbounty-mcp validate-config --json >/dev/null || exit 1
 
-# Default command starts MCP server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
 CMD ["serve"]
 
-# Labels for metadata
-LABEL org.opencontainers.image.title="BugBounty MCP Server"
-LABEL org.opencontainers.image.description="Comprehensive Model Context Protocol server for bug bounty hunting and penetration testing"
-LABEL org.opencontainers.image.version="1.0.0"
-LABEL org.opencontainers.image.authors="Gokul <apgokul008@gmail.com>"
-LABEL org.opencontainers.image.source="https://github.com/gokulapap/bugbounty-mcp-server"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.title="BugBounty MCP Server" \
+      org.opencontainers.image.description="Scope-safe MCP server for authorized bug bounty work" \
+      org.opencontainers.image.version="2.0.0" \
+      org.opencontainers.image.source="https://github.com/gokulapap/bugbounty-mcp-server" \
+      org.opencontainers.image.licenses="MIT"

@@ -1,256 +1,115 @@
-# Security Policy
+# Security policy and threat model
 
-## Overview
+## Supported version
 
-The BugBounty MCP Server is a powerful penetration testing tool designed for authorized security assessments. This document outlines security considerations, responsible usage guidelines, and our security policies.
+Security fixes are provided for the latest release on `main`. Version 1 was a prototype and is not
+supported.
 
-## Supported Versions
+## Reporting a vulnerability
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| < 1.0   | :x:                |
+Do not open a public issue for a vulnerability that could expose users. Use GitHub's private security
+advisory workflow for this repository. Include the affected version, impact, reproduction steps, and
+any suggested mitigation. Do not include real credentials, customer data, or targets you are not
+authorized to test.
 
-## Responsible Usage
+## Authorization model
 
-### Legal Requirements
+The operator is responsible for obtaining permission from the asset owner. The server adds technical
+guardrails but cannot determine whether a person is legally authorized.
 
-Before using this tool, ensure you:
+Safe mode defaults to enabled and fails closed:
 
-1. **Have explicit written permission** to test the target systems
-2. **Comply with all applicable laws** and regulations in your jurisdiction
-3. **Respect the scope** of authorized testing
-4. **Follow responsible disclosure** practices for any vulnerabilities discovered
+- An empty `ALLOWED_TARGETS` permits no network operations.
+- Exact domains, wildcard subdomains, IPs, and CIDR ranges use canonical matching.
+- Block rules take precedence over allow rules.
+- Private and other non-public addresses require `ALLOW_PRIVATE_TARGETS=true`.
+- URLs containing credentials and non-HTTP schemes are rejected.
+- Redirect destinations are rechecked before use.
+- Public hostnames that resolve to non-public addresses are rejected by default.
 
-### Prohibited Uses
+Disabling safe mode is intended only for a separately isolated, explicitly authorized lab.
 
-Do NOT use this tool for:
+## Trust boundaries
 
-- Testing systems without explicit authorization
-- Causing damage or disruption to services
-- Accessing or exfiltrating sensitive data without permission
-- Any illegal activities
-- Testing government, military, or educational systems without proper authorization
+### MCP client and model
 
-### Recommended Practices
+Tool input is untrusted. Every registered tool has a closed JSON Schema, bounded collection/string
+sizes, and a server-side execution timeout. Unknown fields and unknown tools are rejected. Tool-call
+logs contain the tool name, not raw arguments that may contain evidence or tokens.
 
-1. **Start with passive reconnaissance** before active testing
-2. **Use rate limiting** to avoid overwhelming target systems
-3. **Test in isolated environments** when possible
-4. **Document all activities** for audit purposes
-5. **Report vulnerabilities responsibly** to system owners
+### Network targets
 
-## Security Features
+Network content, redirects, certificates, DNS records, headers, and Nuclei output are untrusted.
+Response bodies are bounded and not returned by `http_probe`. HTML is parsed for inventory only and
+is never rendered by the server. Report HTML escapes finding content.
 
-### Built-in Safety Mechanisms
+DNS is checked immediately before an HTTP request, but the HTTP library performs its own resolution.
+That leaves a small DNS-rebinding time-of-check/time-of-use window. Run the server with egress network
+policy that blocks metadata services, loopback, link-local, and internal ranges unless those ranges
+are the explicit assessment scope.
 
-The tool includes several safety features:
+### Local filesystem
 
-#### Target Validation
-```yaml
-safety:
-  safe_mode: true
-  allowed_targets:
-    - "*.example.com"
-    - "192.168.1.0/24"
-  blocked_targets:
-    - "*.gov"
-    - "*.mil"
-    - "*.edu"
-```
+MCP callers cannot choose report or finding-store paths. The configured `DATA_DIR`, `OUTPUT_DIR`, and
+optional operator-configured directory wordlist are trusted configuration. JSON finding updates use a
+sibling temporary file and atomic replacement.
 
-#### Rate Limiting
-- Configurable requests per second
-- Automatic delays between requests
-- Concurrent connection limits
+The store is designed for one server process. Multiple writers on a shared directory need an external
+transactional datastore.
 
-#### Logging and Auditing
-- Comprehensive activity logging
-- Timestamp tracking
-- Target validation logs
+### External tools
 
-### Configuration Security
+Nuclei is disabled by default. When enabled:
 
-#### API Key Management
-- Store API keys as environment variables
-- Never commit API keys to version control
-- Rotate API keys regularly
-- Use least-privilege access
+- The target must pass scope checks.
+- Severity and tag values are schema constrained.
+- The process runs from an argv list without a shell.
+- Stdin is closed.
+- Runtime and captured output are bounded.
+- The process group is killed on timeout.
 
-#### File Permissions
-Ensure proper file permissions:
-```bash
-chmod 600 config.yaml          # Configuration files
-chmod 700 output/              # Output directory
-chmod 700 data/                # Data directory
-```
+Installed templates remain part of the trust boundary. Review and pin them according to your program's
+rules and traffic limits.
 
-## Vulnerability Reporting
+## Transport security
 
-### Reporting Security Issues
+Stdio is the recommended local transport. The server reserves stdout exclusively for MCP protocol
+messages and sends logs to stderr.
 
-If you discover a security vulnerability in the BugBounty MCP Server itself:
+Streamable HTTP binds to loopback by default. The CLI refuses non-loopback binding without an explicit
+`--allow-remote` acknowledgement. The server does not implement user authentication. For remote
+deployment, require all of the following:
 
-1. **Do NOT** create a public GitHub issue
-2. Email security reports to: [apgokul008@gmail.com]
-3. Include detailed information about the vulnerability
-4. Allow reasonable time for response before public disclosure
+- Authenticated TLS termination.
+- Network allow-listing or a private network.
+- Per-user authorization and audit logging at the proxy.
+- Request and concurrency limits.
+- Egress policy appropriate to the authorized targets.
+- A non-root, read-only runtime with only `DATA_DIR` and `OUTPUT_DIR` writable.
 
-### Information to Include
+Do not expose the HTTP endpoint directly to the public internet.
 
-When reporting security issues, please include:
+## Secrets
 
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact assessment
-- Suggested mitigation (if any)
-- Your contact information
+- Keep `.env` untracked and readable only by the operator.
+- Prefer injecting environment variables from a secret manager in deployed environments.
+- Never place secrets in MCP client configuration committed to source control.
+- Health and validation output reports only counts, booleans, paths, and dependency availability.
+- If a secret was ever committed, removing the file in a later commit is insufficient: rotate the
+  secret and follow the hosting provider's history-rewrite procedure if required.
 
-### Response Timeline
-
-- **Initial Response**: Within 48 hours
-- **Assessment**: Within 7 days
-- **Fix Development**: Within 30 days (depending on severity)
-- **Public Disclosure**: Coordinated with reporter
-
-## Security Best Practices
-
-### For Users
-
-#### Environment Setup
-1. **Use isolated environments** for testing
-2. **Keep tools updated** to latest versions
-3. **Implement network segmentation** for testing networks
-4. **Use VPN or proxy** for anonymity when authorized
-
-#### Data Handling
-1. **Encrypt sensitive data** at rest and in transit
-2. **Limit data retention** to necessary timeframes
-3. **Secure disposal** of collected data
-4. **Comply with data protection** regulations (GDPR, CCPA, etc.)
-
-#### Access Control
-1. **Use strong authentication** for tool access
-2. **Implement role-based access** control
-3. **Regular access reviews** and deprovisioning
-4. **Multi-factor authentication** when possible
-
-### For Developers
-
-#### Code Security
-1. **Input validation** for all user inputs
-2. **Output encoding** to prevent injection attacks
-3. **Secure defaults** in configuration
-4. **Regular dependency updates**
-
-#### Testing
-1. **Security testing** of new features
-2. **Code reviews** for security implications
-3. **Automated security scanning** in CI/CD
-4. **Penetration testing** of the tool itself
-
-## Compliance Considerations
-
-### Legal Frameworks
-
-Be aware of relevant legal frameworks:
-
-- **Computer Fraud and Abuse Act (CFAA)** - United States
-- **General Data Protection Regulation (GDPR)** - European Union
-- **Personal Information Protection Act** - Various countries
-- **Local cybersecurity laws** - Check your jurisdiction
-
-### Industry Standards
-
-Align testing with industry standards:
-
-- **OWASP Testing Guide**
-- **NIST Cybersecurity Framework**
-- **ISO 27001/27002**
-- **SANS Penetration Testing Guidelines**
-
-### Documentation Requirements
-
-Maintain documentation for:
-
-- Authorization letters
-- Testing scope and methodology
-- Findings and evidence
-- Remediation recommendations
-- Legal compliance attestations
-
-## Incident Response
-
-### If Unauthorized Use is Detected
-
-If you become aware of unauthorized use of this tool:
-
-1. **Document the incident** with timestamps and evidence
-2. **Report to appropriate authorities** if laws were violated
-3. **Notify affected parties** as required by law
-4. **Implement preventive measures** to avoid recurrence
-
-### If You Accidentally Test Unauthorized Systems
-
-If you accidentally test systems without authorization:
-
-1. **Stop testing immediately**
-2. **Document what occurred**
-3. **Notify the system owner** if contact information is available
-4. **Delete any collected data**
-5. **Report the incident** to your organization's security team
-
-## Training and Awareness
-
-### Required Knowledge
-
-Users should have knowledge of:
-
-- Network security fundamentals
-- Web application security
-- Legal and ethical considerations
-- Incident response procedures
-
-### Recommended Training
-
-- OWASP security training
-- Certified Ethical Hacker (CEH)
-- Offensive Security certifications
-- Legal training on cybersecurity laws
-
-## Updates and Patches
-
-### Security Updates
-
-- Monitor security advisories
-- Apply patches promptly
-- Test updates in non-production environments
-- Maintain update documentation
-
-### Version Control
-
-- Use only official releases
-- Verify checksums and signatures
-- Avoid modified or unofficial versions
-- Keep backup of known-good versions
-
-## Contact Information
-
-### Security Team
-- Email: apgokul008@gmail.com
-- PGP Key: [Link to public key]
-- Response Time: 48 hours
-
-### Legal Questions
-- Email: apgokul008@gmail.com
-- Phone: [Phone number]
-- Business Hours: 9 AM - 5 PM EST
-
-### General Support
-- GitHub Issues: For non-security issues
-- Email: apgokul008@gmail.com
-- Documentation: README.md
-
----
-
-**Remember**: With great power comes great responsibility. Use this tool ethically and legally to make the internet a safer place for everyone.
+## Operational controls
+
+- Start with a low `REQUESTS_PER_SECOND` and narrow scope.
+- Keep `MAX_PORTS_PER_SCAN`, crawl limits, and directory request limits small.
+- Use program-approved user agents where required.
+- Manually verify tool signals before creating or submitting a finding.
+- Back up the finding store and restrict its filesystem permissions; evidence may be sensitive.
+- Review MCP client transcripts because tool results can contain target metadata.
+
+## Non-goals
+
+This project is not a full penetration-testing framework, exploitation platform, credential manager,
+multi-tenant service, browser sandbox, or vulnerability oracle. It intentionally does not provide
+credential dumping, persistence, anti-forensics, evasion, social engineering, reverse shells, or
+destructive payload generation.

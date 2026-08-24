@@ -1,113 +1,58 @@
-version: '3.8'
-
 services:
   bugbounty-mcp:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: bugbounty-mcp-server
-    image: bugbounty-mcp:latest
-    restart: unless-stopped
-    
-    # Port forwarding for MCP server
+    image: bugbounty-mcp:2.0.0
+    command:
+      - serve
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3001"
+      - --allow-remote
     ports:
-      - "3001:3001"
-    
-    # Environment variables
+      - "127.0.0.1:3001:3001"
     environment:
-      # API Keys (set these in .env file or pass directly)
-      - SHODAN_API_KEY=${SHODAN_API_KEY:-}
-      - CENSYS_API_ID=${CENSYS_API_ID:-}
-      - CENSYS_API_SECRET=${CENSYS_API_SECRET:-}
-      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - SECURITYTRAILS_API_KEY=${SECURITYTRAILS_API_KEY:-}
-      - HUNTER_IO_API_KEY=${HUNTER_IO_API_KEY:-}
-      - BINARYEDGE_API_KEY=${BINARYEDGE_API_KEY:-}
-      
-      # Configuration
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - OUTPUT_DIR=/app/output
-      - SAFE_MODE=${SAFE_MODE:-true}
-      
-    # Volumes for persistent data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SAFE_MODE: ${SAFE_MODE:-true}
+      ALLOWED_TARGETS: ${ALLOWED_TARGETS:-}
+      BLOCKED_TARGETS: ${BLOCKED_TARGETS:-}
+      ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-false}
+      REQUESTS_PER_SECOND: ${REQUESTS_PER_SECOND:-5}
+      DEFAULT_TIMEOUT: ${DEFAULT_TIMEOUT:-15}
+      CONNECT_TIMEOUT: ${CONNECT_TIMEOUT:-2}
+      TOOL_TIMEOUT: ${TOOL_TIMEOUT:-300}
+      MAX_TOOL_OUTPUT_CHARS: ${MAX_TOOL_OUTPUT_CHARS:-200000}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-30}
+      MAX_PORTS_PER_SCAN: ${MAX_PORTS_PER_SCAN:-1024}
+      MAX_RESPONSE_BYTES: ${MAX_RESPONSE_BYTES:-1000000}
+      MAX_REDIRECTS: ${MAX_REDIRECTS:-5}
+      MAX_CRAWL_DEPTH: ${MAX_CRAWL_DEPTH:-2}
+      MAX_PAGES_TO_CRAWL: ${MAX_PAGES_TO_CRAWL:-30}
+      MAX_DIRECTORY_REQUESTS: ${MAX_DIRECTORY_REQUESTS:-100}
+      ENABLE_NUCLEI: "false"
+      DATA_DIR: /app/data
+      OUTPUT_DIR: /app/output
     volumes:
-      # Persistent data directories
-      - ./output:/app/output
       - ./data:/app/data
-      - ./logs:/app/logs
-      - ./cache:/app/cache
-      
-      # Configuration files
-      - ./.env:/app/.env:ro
-      
-      # Custom wordlists (optional)
-      - ./wordlists:/app/wordlists
-    
-    # Network configuration
-    networks:
-      - bugbounty-network
-    
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
-    
-    # Security options
+      - ./output:/app/output
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
-    
-    # Temporary filesystem for better performance
-    tmpfs:
-      - /tmp:noexec,nosuid,size=100m
-      - /var/tmp:noexec,nosuid,size=50m
-    
-    # Health check
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 3001 || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # Optional: Web interface (future development)
-  bugbounty-web:
-    build:
-      context: .
-      dockerfile: Dockerfile.web
-    container_name: bugbounty-web-interface
-    image: bugbounty-web:latest
     restart: unless-stopped
-    
-    ports:
-      - "8080:8080"
-    
-    depends_on:
-      - bugbounty-mcp
-    
-    networks:
-      - bugbounty-network
-    
-    # Comment out this service if not using web interface
-    profiles:
-      - web
-    
-    environment:
-      - MCP_SERVER_URL=http://bugbounty-mcp:8080
-
-networks:
-  bugbounty-network:
-    driver: bridge
-    name: bugbounty-network
-
-volumes:
-  # Named volumes for better management
-  bugbounty-data:
-    name: bugbounty-data
-  bugbounty-cache:
-    name: bugbounty-cache
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; socket.create_connection(('127.0.0.1', 3001), 2).close()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

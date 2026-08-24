@@ -1,45 +1,52 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bugbounty-mcp-server"
-version = "1.0.0"
-description = "Comprehensive MCP server for bug bounty hunting and web application penetration testing"
-authors = [{name = "Gokul", email = "apgokul008@gmail.com"}]
-license = {text = "MIT"}
+version = "2.0.0"
+description = "Scope-safe Model Context Protocol server for authorized bug bounty reconnaissance, scanning, and reporting"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Gokul AP", email = "apgokul008@gmail.com" }]
+keywords = ["mcp", "security", "bug-bounty", "reconnaissance"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
-    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
 ]
 dependencies = [
-    "click>=8.1.0",
-    "aiohttp>=3.8.0", 
-    "requests>=2.28.0",
-    "pydantic>=2.11.0,<3.0.0",
-    "python-dotenv>=1.0.0",
-    "colorama>=0.4.6",
-    "tabulate>=0.9.0",
+    "aiohttp>=3.10,<4",
+    "click>=8.1,<9",
+    "cryptography>=42,<47",
+    "dnspython>=2.6,<3",
+    "jsonschema>=4.23,<5",
+    "mcp>=2.0,<3",
+    "pydantic>=2.11,<3",
+    "python-dotenv>=1.0,<2",
+    "PyYAML>=6.0,<7",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "flake8>=6.0.0",
-    "mypy>=1.5.0",
-    "pre-commit>=3.4.0",
+    "build>=1.2,<2",
+    "mypy>=1.15,<2",
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<2",
+    "pytest-cov>=6,<8",
+    "ruff>=0.11,<1",
+    "twine>=6,<7",
+    "types-jsonschema>=4.23,<5",
+    "types-PyYAML>=6.0,<7",
 ]
 
 [project.scripts]
@@ -47,6 +54,7 @@ bugbounty-mcp = "bugbounty_mcp_server.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/gokulapap/bugbounty-mcp-server"
+Documentation = "https://github.com/gokulapap/bugbounty-mcp-server#readme"
 Repository = "https://github.com/gokulapap/bugbounty-mcp-server"
 Issues = "https://github.com/gokulapap/bugbounty-mcp-server/issues"
 
@@ -54,19 +62,42 @@ Issues = "https://github.com/gokulapap/bugbounty-mcp-server/issues"
 where = ["."]
 include = ["bugbounty_mcp_server*"]
 
-[tool.black]
-line-length = 88
-target-version = ['py39']
-
-[tool.mypy]
-python_version = "3.9"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
+[tool.setuptools.package-data]
+bugbounty_mcp_server = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
+addopts = "--strict-markers --strict-config -ra"
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["bugbounty_mcp_server"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = [
+    "S101",
+    "S104",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_return_any = true
+warn_unused_configs = true
+exclude = ["tests/"]
