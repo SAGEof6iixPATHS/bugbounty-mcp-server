@@ -11,6 +11,8 @@
 - Run the container as its built-in UID/GID 10001 with a read-only root filesystem.
 - Back up `DATA_DIR`; treat both data and reports as sensitive assessment material.
 - Keep Nuclei disabled unless its binary and template set are reviewed and pinned.
+- Keep passive CLI adapters disabled unless their binaries, data sources, credentials, upstream
+  terms, and the bounty program's passive-enumeration rules are reviewed.
 
 ## Health and readiness
 
@@ -18,6 +20,9 @@
 The `server_health` tool reports version, scope readiness, optional dependency status, storage paths,
 and in-process execution metrics. `assessment_summary` adds severity/status counts and assessed
 targets.
+
+Health reports Subfinder, Amass, Assetfinder, and gau availability separately from enablement. A
+binary being present does not enable its MCP adapter.
 
 The container health check validates that configuration can be loaded. Compose also checks that the
 HTTP listener accepts TCP connections; successful TCP connection is not an authenticated MCP probe.

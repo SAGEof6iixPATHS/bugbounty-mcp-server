@@ -29,3 +29,7 @@ All tool inputs use closed Draft 2020-12 JSON Schemas. Outputs expose typed top-
 `outputSchema`, are returned in `structuredContent`, and include JSON text for clients that do not
 consume structured output. Expected failures set `isError` and return a stable code such as
 `invalid_args`, `target_not_allowed`, `tool_disabled`, `timeout`, or `output_limit`.
+
+The 53-tool surface covers local analysis, DNS and passive discovery, bounded HTTP/API posture,
+scope-pinned TCP/TLS checks, optional reviewed bug-bounty binaries, and finding lifecycle
+management. See [TOOL_CATALOG.md](TOOL_CATALOG.md) for the complete safety-classified catalog.

@@ -8,7 +8,7 @@ MCP client
   └─ Streamable HTTP → bearer guard ─────┤
                                           ▼
                                 MCP SDK v2 low-level server
-                                  ├─ tools (24)
+                                  ├─ tools (53)
                                   ├─ resources + templates
                                   ├─ prompts + completion
                                   └─ structured errors/results
@@ -16,7 +16,7 @@ MCP client
                   ┌───────────────────────┼────────────────────────┐
                   ▼                       ▼                        ▼
           scope + DNS pinning      finding/evidence store     bounded adapters
-                  │                  atomic private files       HTTP/TCP/TLS/Nuclei
+                  │                  atomic private files       HTTP/TCP/TLS/CLI
                   ▼
          authorized destination
 ```
@@ -26,8 +26,10 @@ MCP client
 - `config.py` merges defaults, YAML/JSON, and environment variables into closed Pydantic models.
 - `scope.py` canonicalizes domains, IDNs, IPs, URLs, ports, wildcards, and CIDRs. Block rules win.
   DNS answers are validated and returned to callers so the connection uses the checked address.
-- `tools/core.py` contains the bounded, auditable tool registry. Each tool has closed input and
-  documented output JSON Schemas.
+- `tools/core.py` contains the bounded, auditable tool registry and network/subprocess adapters.
+  Each tool has closed input and documented output JSON Schemas.
+- `tools/analyzers.py` contains pure parsers and scoring functions for local URL, secret, cloud,
+  CSP, robots, JavaScript, OpenAPI, domain-variation, and CVSS workflows.
 - `findings.py` owns atomic finding updates, structured metadata, private evidence, SHA-256
   verification, and JSON/Markdown/HTML/SARIF exports.
 - `catalog.py` projects guidance and runtime state through MCP resources, templates, prompts, and

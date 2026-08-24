@@ -13,6 +13,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+SUPPORTED_EXTERNAL_TOOLS = frozenset({"amass", "assetfinder", "gau", "subfinder"})
+
 
 def _parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
@@ -45,6 +47,33 @@ class ToolConfig(BaseModel):
 
     nuclei_path: str = "nuclei"
     enable_nuclei: bool = False
+    enabled_external_tools: list[str] = Field(default_factory=list)
+    subfinder_path: str = "subfinder"
+    amass_path: str = "amass"
+    assetfinder_path: str = "assetfinder"
+    gau_path: str = "gau"
+
+    @field_validator("enabled_external_tools")
+    @classmethod
+    def validate_external_tools(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(value.strip().lower() for value in values if value.strip()))
+        unsupported = sorted(set(normalized) - SUPPORTED_EXTERNAL_TOOLS)
+        if unsupported:
+            raise ValueError("unsupported external tools: " + ", ".join(unsupported))
+        return sorted(normalized)
+
+    @field_validator(
+        "nuclei_path",
+        "subfinder_path",
+        "amass_path",
+        "assetfinder_path",
+        "gau_path",
+    )
+    @classmethod
+    def validate_tool_path(cls, value: str) -> str:
+        if not value.strip() or any(character in value for character in "\r\n\x00"):
+            raise ValueError("external tool paths must be non-empty single-line values")
+        return value.strip()
 
 
 class ScanConfig(BaseModel):
@@ -151,7 +180,7 @@ class BugBountyConfig(BaseModel):
     requests_per_second: float = Field(default=5.0, gt=0, le=100)
     tool_timeout: float = Field(default=300.0, gt=0, le=3600)
     max_tool_output_chars: int = Field(default=200_000, ge=1000, le=2_000_000)
-    user_agent: str = "bugbounty-mcp-server/2.1 (+authorized-security-testing)"
+    user_agent: str = "bugbounty-mcp-server/2.2 (+authorized-security-testing)"
     tools: ToolConfig = Field(default_factory=ToolConfig)
     scanning: ScanConfig = Field(default_factory=ScanConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
@@ -220,6 +249,11 @@ class BugBountyConfig(BaseModel):
             "HTTP_BEARER_TOKEN": (("http", "bearer_token"), SecretStr),
             "NUCLEI_PATH": (("tools", "nuclei_path"), str),
             "ENABLE_NUCLEI": (("tools", "enable_nuclei"), _parse_bool),
+            "ENABLED_EXTERNAL_TOOLS": (("tools", "enabled_external_tools"), _parse_csv),
+            "SUBFINDER_PATH": (("tools", "subfinder_path"), str),
+            "AMASS_PATH": (("tools", "amass_path"), str),
+            "ASSETFINDER_PATH": (("tools", "assetfinder_path"), str),
+            "GAU_PATH": (("tools", "gau_path"), str),
             "DEFAULT_PORTS": (
                 ("scanning", "default_ports"),
                 lambda value: [int(port) for port in _parse_csv(value)],

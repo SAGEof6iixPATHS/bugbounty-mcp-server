@@ -6,15 +6,17 @@ authorized to test. Use `scope_check` before any network operation.
 ## Recommended assessment flow
 
 1. Confirm one or many targets with `scope_check` or `batch_scope_check`.
-2. Gather passive data with `dns_enumeration`, `email_security_analysis`, and
-   `subdomain_enumeration`.
-3. Confirm exposed services with a bounded `port_scan`.
-4. Use `http_probe`, `ssl_scan`, `headers_analysis`, `cookie_security_analysis`, `cors_scan`,
-   `security_txt_analysis`, and `openapi_discovery`.
-5. Inventory same-host pages and paths with `web_crawler` and `web_directory_scan`.
-6. If the operator enabled it, use narrowly filtered `nuclei_scan` calls.
-7. Manually confirm suspected issues before calling `create_finding`.
-8. Attach redacted, hashed evidence, track resolution, and export HTML, Markdown, JSON, or SARIF.
+2. Run local-only analysis for supplied URLs, API documents, tokens, cloud references, secrets, and
+   CVSS vectors before opening the network.
+3. Gather passive data with DNS/email posture, certificate transparency, and—only when
+   operator-enabled—Subfinder, passive Amass, Assetfinder, or gau.
+4. Confirm exposed services with bounded TCP and TLS tools.
+5. Use HTTP inventory, header/CSP/cookie/CORS/cache/SRI analysis, metadata discovery, API discovery,
+   and technology fingerprinting.
+6. Inventory same-host pages, paths, scripts, source maps, robots rules, and sitemap URLs.
+7. If the operator enabled it, use narrowly filtered `nuclei_scan` calls.
+8. Manually confirm suspected issues before calling `create_finding`.
+9. Attach redacted, hashed evidence, track resolution, and export HTML, Markdown, JSON, or SARIF.
 
 ## Example tool inputs
 
@@ -175,6 +177,49 @@ used. The caller cannot supply an arbitrary filesystem path.
 
 The JWT is decoded locally. Its signature is not verified because no trust key or issuer policy is
 provided. Treat results as metadata review only.
+
+### Local URL, secret, cloud, CVSS, and OpenAPI analysis
+
+```json
+{"url": "https://example.com/view?id=42&redirect_uri=https%3A%2F%2Fexample.com"}
+```
+
+Use that payload with `url_parameter_analysis`. Values are hashed and never echoed. The
+`secret_pattern_analysis` and `cloud_asset_reference_analysis` tools accept up to 1 MB of supplied
+text and do not access discovered values. `cvss_v31_calculator` accepts a base vector:
+
+```json
+{"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}
+```
+
+`openapi_security_analysis` accepts a supplied JSON or alias-free YAML document, unlike
+`openapi_discovery`, which retrieves bounded same-origin candidates.
+
+### Expanded web posture
+
+The following tools accept `{"url":"https://example.com/"}` unless their schema advertises
+additional optional fields:
+
+- `csp_analysis`, `cache_policy_analysis`, `sri_analysis`, and `technology_fingerprint`
+- `robots_txt_analysis`, `sitemap_analysis`, and `web_metadata_discovery`
+- `javascript_endpoint_discovery`, `source_map_discovery`, and `favicon_fingerprint`
+- `oauth_oidc_discovery`, `graphql_endpoint_discovery`, and `http_method_analysis`
+- `sensitive_file_exposure_scan`, which uses HEAD and never returns file bodies
+
+Use `bugbounty-mcp list-tools --json` to inspect exact limits and schemas.
+
+### Passive CLI discovery
+
+After installing and explicitly enabling a supported binary, call its adapter with an authorized
+domain:
+
+```json
+{"domain": "example.com"}
+```
+
+Supported adapters are `subfinder_discovery`, `amass_passive_discovery`,
+`assetfinder_discovery`, and `gau_url_discovery`. Each invocation is time/output bounded and its
+results are rechecked against scope. Passive data providers still receive the queried domain.
 
 ### Nuclei
 

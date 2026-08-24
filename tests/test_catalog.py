@@ -56,10 +56,12 @@ async def test_mcp_resources_prompts_templates_and_completions(tmp_path) -> None
 
     uris = {str(resource.uri) for resource in resources.resources}
     assert "bugbounty://reference/tools" in uris
+    assert "bugbounty://guides/external-integrations" in uris
     assert f"bugbounty://findings/{finding_id}" in uris
+    assert len(resources.resources) == 14
     assert len(templates.resource_templates) == 2
     assert "validated DNS answer" in guide.contents[0].text
-    assert len(json.loads(tool_catalog.contents[0].text)) == 24
+    assert len(json.loads(tool_catalog.contents[0].text)) == 53
     assert json.loads(config_schema.contents[0].text)["title"] == "BugBountyConfig"
     assert json.loads(assessment.contents[0].text)["scope"]["configured"] is True
     assert json.loads(finding_list.contents[0].text)["count"] == 1

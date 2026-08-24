@@ -27,5 +27,10 @@ output:
 tools:
   enable_nuclei: false
   nuclei_path: nuclei
+  enabled_external_tools: []
+  subfinder_path: subfinder
+  amass_path: amass
+  assetfinder_path: assetfinder
+  gau_path: gau
 http:
   bearer_token: null

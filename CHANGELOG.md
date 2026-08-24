@@ -2,6 +2,20 @@
 
 All notable changes are documented here.
 
+## 2.2.0 - 2026-08-24
+
+- Expanded the implemented MCP tool surface from 24 to 53 tools with typed outputs and honest
+  annotations.
+- Added local URL-parameter, secret-pattern, cloud-reference, CVSS v3.1, OpenAPI security, and
+  typo-domain analysis without network access.
+- Added DNSSEC publication, wildcard DNS, dangling CNAME, batch HTTP, CSP, robots, sitemap,
+  technology, web metadata, JavaScript endpoint, source-map, OAuth/OIDC, GraphQL, sensitive-file,
+  cache, SRI, favicon, HTTP method, and TLS protocol analysis.
+- Added disabled-by-default passive adapters for Subfinder, Amass, Assetfinder, and gau with
+  argv-only execution, output/runtime bounds, and result scope filtering.
+- Added a safety-classified 53-tool catalog, expanded usage guidance, environment examples, health
+  reporting, and coverage for the new workflows.
+
 ## 2.1.0 - 2026-08-24
 
 - Added six implemented tools for batch scope checks, email security, security.txt, OpenAPI

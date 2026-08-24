@@ -121,7 +121,7 @@ def test_registry_has_unique_honest_schema_surface(tmp_path) -> None:
     definitions = tools.get_tools()
     names = [definition.name for definition in definitions]
 
-    assert len(names) == 24
+    assert len(names) == 53
     assert len(names) == len(set(names))
     assert "anti_forensics_techniques" not in names
     assert "server_health" in names

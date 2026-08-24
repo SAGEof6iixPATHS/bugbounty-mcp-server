@@ -2,7 +2,7 @@ services:
   bugbounty-mcp:
     build:
       context: .
-    image: bugbounty-mcp:2.1.0
+    image: bugbounty-mcp:2.2.0
     command:
       - serve
       - --transport
@@ -37,6 +37,7 @@ services:
       MAX_EVIDENCE_BYTES: ${MAX_EVIDENCE_BYTES:-500000}
       HTTP_BEARER_TOKEN: ${HTTP_BEARER_TOKEN:-}
       ENABLE_NUCLEI: "false"
+      ENABLED_EXTERNAL_TOOLS: ""
       DATA_DIR: /app/data
       OUTPUT_DIR: /app/output
     volumes:

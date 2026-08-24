@@ -82,3 +82,18 @@ def test_http_token_is_validated_and_never_serialized_in_plaintext(monkeypatch) 
         BugBountyConfig(http={"bearer_token": "too-short"})
     with pytest.raises(ValidationError, match="without whitespace"):
         BugBountyConfig(http={"bearer_token": "a" * 24 + "\n"})
+
+
+def test_external_tool_configuration_is_explicit_and_validated(monkeypatch) -> None:
+    monkeypatch.setenv("ENABLED_EXTERNAL_TOOLS", "gau,subfinder,gau")
+    monkeypatch.setenv("SUBFINDER_PATH", "/opt/tools/subfinder")
+
+    config = BugBountyConfig.load(env_file=None)
+
+    assert config.tools.enabled_external_tools == ["gau", "subfinder"]
+    assert config.tools.subfinder_path == "/opt/tools/subfinder"
+
+    with pytest.raises(ValidationError, match="unsupported external tools"):
+        BugBountyConfig(tools={"enabled_external_tools": ["sqlmap"]})
+    with pytest.raises(ValidationError, match="single-line"):
+        BugBountyConfig(tools={"gau_path": "gau\n--dangerous"})

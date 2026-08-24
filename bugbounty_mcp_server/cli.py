@@ -144,6 +144,14 @@ def _configuration_status(config: BugBountyConfig) -> dict[str, Any]:
         "optional_tools": {
             "nuclei_enabled": config.tools.enable_nuclei,
             "nuclei_available": shutil.which(config.tools.nuclei_path) is not None,
+            "external": {
+                name: {
+                    "enabled": name in config.tools.enabled_external_tools,
+                    "available": shutil.which(str(getattr(config.tools, f"{name}_path")))
+                    is not None,
+                }
+                for name in ("amass", "assetfinder", "gau", "subfinder")
+            },
         },
     }
 
@@ -172,6 +180,11 @@ def validate_config(config: BugBountyConfig, as_json: bool) -> None:
         + ("enabled" if nuclei["nuclei_enabled"] else "disabled")
         + ", "
         + ("binary found" if nuclei["nuclei_available"] else "binary not found")
+    )
+    external = nuclei["external"]
+    click.echo(
+        "Passive CLI adapters enabled: "
+        + (", ".join(name for name, state in external.items() if state["enabled"]) or "none")
     )
 
 

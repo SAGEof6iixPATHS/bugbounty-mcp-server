@@ -3,8 +3,9 @@
 A production-oriented Model Context Protocol server for authorized bug bounty reconnaissance,
 bounded security checks, and finding management.
 
-Version 2.1 replaces the previous 92-tool prototype with 24 tools that are implemented, schema
-validated, scope checked, output bounded, and covered by protocol-level tests. It uses the current
+Version 2.2 exposes 53 implemented tools. Every tool has closed input and typed output schemas,
+server-side bounds, honest MCP annotations, and protocol-level tests. Network operations are scope
+checked; local analyzers do not open the network. The server uses the current
 [MCP Python SDK](https://py.sdk.modelcontextprotocol.io/) v2 API and supports stdio and Streamable
 HTTP transports.
 
@@ -15,16 +16,18 @@ HTTP transports.
 
 | Area | Tools |
 | --- | --- |
-| Safety | `scope_check`, `batch_scope_check`, `server_health`, `assessment_summary` |
-| Reconnaissance | `dns_enumeration`, `email_security_analysis`, `subdomain_enumeration` |
-| HTTP/TLS | `http_probe`, `headers_analysis`, `cors_scan`, `cookie_security_analysis`, `security_txt_analysis`, `openapi_discovery`, `ssl_scan` |
-| Bounded scanning | `port_scan`, `web_crawler`, `web_directory_scan`, optional `nuclei_scan` |
-| Offline analysis | `jwt_security_test` |
+| Safety and orchestration | `scope_check`, `batch_scope_check`, `server_health`, `assessment_summary` |
+| Local analysis | `domain_variation_generator`, `url_parameter_analysis`, `secret_pattern_analysis`, `cloud_asset_reference_analysis`, `cvss_v31_calculator`, `jwt_security_test`, `openapi_security_analysis` |
+| DNS and asset discovery | `dns_enumeration`, `dnssec_posture_analysis`, `wildcard_dns_analysis`, `dangling_dns_analysis`, `email_security_analysis`, `subdomain_enumeration` |
+| HTTP discovery | `http_probe`, `batch_http_probe`, `web_crawler`, `web_directory_scan`, `web_metadata_discovery`, `robots_txt_analysis`, `sitemap_analysis`, `javascript_endpoint_discovery`, `source_map_discovery`, `favicon_fingerprint` |
+| Web and API posture | `headers_analysis`, `csp_analysis`, `cors_scan`, `cookie_security_analysis`, `cache_policy_analysis`, `sri_analysis`, `technology_fingerprint`, `security_txt_analysis`, `openapi_discovery`, `oauth_oidc_discovery`, `graphql_endpoint_discovery`, `http_method_analysis`, `sensitive_file_exposure_scan` |
+| Network and TLS | `ssl_scan`, `tls_configuration_analysis`, `port_scan` |
+| Optional integrations | `nuclei_scan`, `subfinder_discovery`, `amass_passive_discovery`, `assetfinder_discovery`, `gau_url_discovery` |
 | Findings and reports | `create_finding`, `add_finding_evidence`, `list_findings`, `update_finding`, `generate_vulnerability_report` |
 
 The server also exposes MCP-native knowledge and state:
 
-- Five bundled guidance resources plus live tool-schema, configuration-schema, assessment-state,
+- Nine bundled guidance resources plus live tool-schema, configuration-schema, assessment-state,
   finding, and integrity-checked evidence resources.
 - Resource templates for findings and evidence.
 - Five reusable prompts for planning, passive reconnaissance, triage, disclosure, and remediation
@@ -32,14 +35,15 @@ The server also exposes MCP-native knowledge and state:
 - Argument completion for configured targets, finding IDs, and report audiences.
 
 The server deliberately does not expose simulated scanners, credential dumping, persistence,
-anti-forensics, social-engineering templates, or payload generators. A smaller honest tool surface
-is safer and more useful to an MCP client than a large catalog of placeholders.
+anti-forensics, social-engineering templates, destructive exploit automation, or payload
+generators. Tool count never overrides authorization, bounded execution, or truthful results.
 
 ## Requirements
 
 - Python 3.10 or newer; Python 3.11+ is recommended.
 - An MCP-compatible client.
-- Nuclei is optional and disabled unless explicitly enabled.
+- Nuclei and the four passive bug-bounty CLI adapters are optional and disabled unless explicitly
+  enabled.
 
 ## Install
 
@@ -170,6 +174,11 @@ Important settings:
 | `HTTP_BEARER_TOKEN` | empty | Optional Streamable HTTP bearer token, minimum 24 characters |
 | `ENABLE_NUCLEI` | `false` | Enable the optional Nuclei adapter |
 | `NUCLEI_PATH` | `nuclei` | Nuclei executable name or path |
+| `ENABLED_EXTERNAL_TOOLS` | empty | Comma-separated opt-in: `subfinder,amass,assetfinder,gau` |
+| `SUBFINDER_PATH` | `subfinder` | Subfinder executable name or path |
+| `AMASS_PATH` | `amass` | Amass executable name or path |
+| `ASSETFINDER_PATH` | `assetfinder` | Assetfinder executable name or path |
+| `GAU_PATH` | `gau` | gau executable name or path |
 
 See [env.example](env.example) for the full environment template.
 
@@ -202,6 +211,24 @@ NUCLEI_PATH=nuclei
 The adapter passes an argv list without a shell, validates severities and tags, restricts the target
 to scope, enforces a timeout and output bound, and returns a normalized finding subset. You are
 still responsible for reviewing installed templates and their request behavior.
+
+### Passive bug-bounty CLI adapters
+
+Subfinder, Amass passive mode, Assetfinder, and gau are separately installed operator tools. Enable
+only the binaries you have reviewed:
+
+```dotenv
+ENABLED_EXTERNAL_TOOLS=subfinder,amass,assetfinder,gau
+SUBFINDER_PATH=subfinder
+AMASS_PATH=amass
+ASSETFINDER_PATH=assetfinder
+GAU_PATH=gau
+```
+
+The adapters use argv-only subprocess execution, time and output limits, and discard results that
+do not revalidate against `ALLOWED_TARGETS`. No external binary is downloaded by this project or
+enabled by default. Passive providers can still receive the queried domain, so review their terms
+and the applicable bounty program rules.
 
 ### Findings and reports
 
@@ -248,7 +275,7 @@ For stdio from a container:
 docker run --rm -i \
   -e SAFE_MODE=true \
   -e ALLOWED_TARGETS=example.com,*.example.com \
-  bugbounty-mcp:2.1.0 serve
+  bugbounty-mcp:2.2.0 serve
 ```
 
 ## Design notes
@@ -271,6 +298,7 @@ Further resources:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations guide](docs/OPERATIONS.md)
 - [MCP feature catalog](docs/MCP_FEATURES.md)
+- [Complete 53-tool catalog](docs/TOOL_CATALOG.md)
 - [Safe YAML configuration](examples/config.safe.yaml)
 - [Generic MCP client configuration](examples/mcp-client.json)
 - [Contributing guide](CONTRIBUTING.md)

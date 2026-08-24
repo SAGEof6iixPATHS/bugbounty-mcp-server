@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import math
 import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -15,11 +17,12 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import aiohttp
 import dns.exception
@@ -36,6 +39,18 @@ from ..config import BugBountyConfig
 from ..findings import CONFIDENCES, SEVERITIES, STATUSES, FindingStore
 from ..scope import ScopePolicy, ScopeViolation, parse_target
 from ..utils import RateLimiter, bounded_map, parse_ports, run_command_async, stable_hash, utc_now
+from .analyzers import (
+    analyze_cloud_references,
+    analyze_csp,
+    analyze_openapi_document,
+    analyze_secret_patterns,
+    analyze_url_parameters,
+    calculate_cvss_v31,
+    extract_javascript_endpoints,
+    generate_domain_variants,
+    load_structured_document,
+    parse_robots,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +97,39 @@ _OPENAPI_PATHS = [
     "/api-docs",
     "/v3/api-docs",
 ]
+_WELL_KNOWN_PATHS = [
+    "/.well-known/assetlinks.json",
+    "/.well-known/apple-app-site-association",
+    "/.well-known/change-password",
+    "/.well-known/openid-configuration",
+    "/.well-known/security.txt",
+    "/.well-known/webfinger",
+    "/manifest.json",
+    "/site.webmanifest",
+    "/humans.txt",
+]
+_GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/graphql/v1", "/v1/graphql"]
+_SENSITIVE_EXPOSURE_PATHS: dict[str, tuple[str, str]] = {
+    "/.env": ("critical", "environment configuration"),
+    "/.git/HEAD": ("high", "Git repository metadata"),
+    "/.svn/entries": ("high", "Subversion repository metadata"),
+    "/backup.zip": ("high", "conventional backup archive"),
+    "/config.json": ("medium", "application configuration"),
+    "/debug/vars": ("medium", "runtime debugging data"),
+    "/server-status": ("medium", "web server status"),
+    "/phpinfo.php": ("medium", "PHP runtime information"),
+}
+_TECHNOLOGY_BODY_MARKERS: dict[str, str] = {
+    "__next_data__": "Next.js",
+    "_nuxt/": "Nuxt",
+    "data-reactroot": "React",
+    "ng-version": "Angular",
+    "wp-content/": "WordPress",
+    "drupal-settings-json": "Drupal",
+    "joomla!": "Joomla",
+    "shopify.theme": "Shopify",
+    "cdn.shopify.com": "Shopify",
+}
 _SERVICE_NAMES = {
     21: "ftp",
     22: "ssh",
@@ -190,6 +238,8 @@ class _HTMLInspector(HTMLParser):
         self.links: list[str] = []
         self.forms: list[dict[str, Any]] = []
         self.scripts: list[str] = []
+        self.resources: list[dict[str, Any]] = []
+        self.icons: list[str] = []
         self.generators: list[str] = []
         self.links_truncated = False
         self.forms_truncated = False
@@ -220,7 +270,32 @@ class _HTMLInspector(HTMLParser):
             else:
                 self.forms_truncated = True
         elif tag == "script" and attributes.get("src") and len(self.scripts) < self.max_links:
-            self.scripts.append(attributes["src"] or "")
+            source = attributes["src"] or ""
+            self.scripts.append(source)
+            self.resources.append(
+                {
+                    "tag": "script",
+                    "url": source,
+                    "integrity": attributes.get("integrity"),
+                    "crossorigin": attributes.get("crossorigin"),
+                }
+            )
+        elif tag == "link" and attributes.get("href"):
+            relationship = (attributes.get("rel") or "").lower().split()
+            href = attributes["href"] or ""
+            if any(item in {"stylesheet", "modulepreload", "preload"} for item in relationship):
+                if len(self.resources) < self.max_links:
+                    self.resources.append(
+                        {
+                            "tag": "link",
+                            "url": href,
+                            "rel": relationship,
+                            "integrity": attributes.get("integrity"),
+                            "crossorigin": attributes.get("crossorigin"),
+                        }
+                    )
+            if "icon" in relationship and len(self.icons) < 20:
+                self.icons.append(href)
         elif tag == "meta" and (attributes.get("name") or "").lower() == "generator":
             if attributes.get("content") and len(self.generators) < self.max_forms:
                 self.generators.append(attributes["content"] or "")
@@ -284,7 +359,36 @@ _OUTPUT_SHAPES: dict[str, dict[str, str]] = {
         "allowed": "integer",
         "denied": "integer",
     },
+    "domain_variation_generator": {"domain": "string", "variants": "array", "count": "integer"},
+    "url_parameter_analysis": {
+        "url": "string",
+        "parameters": "array",
+        "parameter_count": "integer",
+    },
+    "secret_pattern_analysis": {
+        "matches": "array",
+        "match_count": "integer",
+        "values_redacted": "boolean",
+    },
+    "cloud_asset_reference_analysis": {
+        "references": "array",
+        "reference_count": "integer",
+        "by_provider": "object",
+    },
+    "cvss_v31_calculator": {"vector": "string", "base_score": "number", "rating": "string"},
+    "openapi_security_analysis": {
+        "format_version": "string",
+        "operation_count": "integer",
+        "findings": "array",
+    },
     "dns_enumeration": {"target": "string", "queried_at": "string", "records": "object"},
+    "dnssec_posture_analysis": {"domain": "string", "records": "object", "signed": "boolean"},
+    "wildcard_dns_analysis": {
+        "domain": "string",
+        "wildcard_detected": "boolean",
+        "probes": "array",
+    },
+    "dangling_dns_analysis": {"domain": "string", "cname_records": "array", "dangling": "boolean"},
     "email_security_analysis": {
         "domain": "string",
         "records": "object",
@@ -297,7 +401,34 @@ _OUTPUT_SHAPES: dict[str, dict[str, str]] = {
         "count": "integer",
     },
     "http_probe": {"requested_url": "string", "final_url": "string", "status": "integer"},
+    "batch_http_probe": {"results": "array", "count": "integer", "errors": "array"},
     "headers_analysis": {"url": "string", "status": "integer", "score": "integer"},
+    "csp_analysis": {"url": "string", "present": "boolean", "findings": "array"},
+    "robots_txt_analysis": {"url": "string", "present": "boolean", "groups": "array"},
+    "sitemap_analysis": {"url": "string", "present": "boolean", "urls": "array"},
+    "technology_fingerprint": {"url": "string", "technologies": "array", "evidence": "object"},
+    "web_metadata_discovery": {"origin": "string", "results": "array", "found_count": "integer"},
+    "javascript_endpoint_discovery": {
+        "url": "string",
+        "endpoints": "array",
+        "endpoint_count": "integer",
+    },
+    "source_map_discovery": {"url": "string", "source_maps": "array", "count": "integer"},
+    "oauth_oidc_discovery": {"origin": "string", "documents": "array", "document_count": "integer"},
+    "graphql_endpoint_discovery": {
+        "origin": "string",
+        "endpoints": "array",
+        "endpoint_count": "integer",
+    },
+    "sensitive_file_exposure_scan": {
+        "origin": "string",
+        "results": "array",
+        "finding_count": "integer",
+    },
+    "cache_policy_analysis": {"url": "string", "cacheable": "boolean", "findings": "array"},
+    "sri_analysis": {"url": "string", "resources": "array", "coverage_percent": "number"},
+    "favicon_fingerprint": {"url": "string", "found": "boolean", "attempts": "array"},
+    "http_method_analysis": {"url": "string", "status": "integer", "allowed_methods": "array"},
     "cors_scan": {"url": "string", "tests": "array", "findings": "array"},
     "cookie_security_analysis": {
         "url": "string",
@@ -311,6 +442,7 @@ _OUTPUT_SHAPES: dict[str, dict[str, str]] = {
         "attempts": "array",
     },
     "ssl_scan": {"target": "string", "port": "integer", "trusted_for_host": "boolean"},
+    "tls_configuration_analysis": {"target": "string", "port": "integer", "protocols": "array"},
     "port_scan": {
         "target": "string",
         "ports_scanned": "integer",
@@ -320,6 +452,10 @@ _OUTPUT_SHAPES: dict[str, dict[str, str]] = {
     "web_directory_scan": {"requests": "integer", "results": "array"},
     "jwt_security_test": {"header": "object", "payload": "object", "findings": "array"},
     "nuclei_scan": {"target": "string", "findings": "array", "finding_count": "integer"},
+    "subfinder_discovery": {"domain": "string", "subdomains": "array", "count": "integer"},
+    "amass_passive_discovery": {"domain": "string", "subdomains": "array", "count": "integer"},
+    "assetfinder_discovery": {"domain": "string", "subdomains": "array", "count": "integer"},
+    "gau_url_discovery": {"domain": "string", "urls": "array", "count": "integer"},
     "create_finding": {"finding": "object"},
     "add_finding_evidence": {"evidence": "object"},
     "list_findings": {"findings": "array", "count": "integer"},
@@ -492,6 +628,90 @@ class SecurityTools:
                 open_world=False,
             ),
             self._spec(
+                "domain_variation_generator",
+                "Generate domain variations",
+                "Generate a bounded typo-oriented candidate list for one authorized domain "
+                "without resolving or contacting any candidate.",
+                _object_schema(
+                    {
+                        "domain": string_target,
+                        "maximum": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "default": 100,
+                        },
+                    },
+                    required=["domain"],
+                ),
+                self.domain_variation_generator,
+                open_world=False,
+            ),
+            self._spec(
+                "url_parameter_analysis",
+                "Analyze URL parameters",
+                "Classify security-relevant query parameters locally while hashing, rather "
+                "than returning, their values.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.url_parameter_analysis,
+                open_world=False,
+            ),
+            self._spec(
+                "secret_pattern_analysis",
+                "Detect exposed secret patterns",
+                "Inspect supplied text locally for common credential formats and return only "
+                "redacted fingerprints and locations.",
+                _object_schema(
+                    {"content": {"type": "string", "minLength": 1, "maxLength": 1_000_000}},
+                    required=["content"],
+                ),
+                self.secret_pattern_analysis,
+                open_world=False,
+            ),
+            self._spec(
+                "cloud_asset_reference_analysis",
+                "Extract cloud asset references",
+                "Extract AWS S3, Google Cloud Storage, Azure Blob, and Firebase references "
+                "from supplied text without accessing them.",
+                _object_schema(
+                    {"content": {"type": "string", "minLength": 1, "maxLength": 1_000_000}},
+                    required=["content"],
+                ),
+                self.cloud_asset_reference_analysis,
+                open_world=False,
+            ),
+            self._spec(
+                "cvss_v31_calculator",
+                "Calculate CVSS v3.1",
+                "Validate a CVSS v3.1 base vector and calculate its score, rating, impact, "
+                "and exploitability locally.",
+                _object_schema(
+                    {"vector": {"type": "string", "minLength": 1, "maxLength": 200}},
+                    required=["vector"],
+                ),
+                self.cvss_v31_calculator,
+                open_world=False,
+            ),
+            self._spec(
+                "openapi_security_analysis",
+                "Analyze an OpenAPI document",
+                "Analyze supplied JSON or alias-free YAML for operations, authentication "
+                "coverage, deprecated endpoints, and security signals.",
+                _object_schema(
+                    {
+                        "document": {"type": "string", "minLength": 1, "maxLength": 1_000_000},
+                        "document_format": {
+                            "type": "string",
+                            "enum": ["auto", "json", "yaml"],
+                            "default": "auto",
+                        },
+                    },
+                    required=["document"],
+                ),
+                self.openapi_security_analysis,
+                open_world=False,
+            ),
+            self._spec(
                 "dns_enumeration",
                 "Enumerate DNS records",
                 "Resolve selected DNS record types for one authorized domain.",
@@ -512,6 +732,41 @@ class SecurityTools:
                     required=["domain"],
                 ),
                 self.dns_enumeration,
+            ),
+            self._spec(
+                "dnssec_posture_analysis",
+                "Inspect DNSSEC posture",
+                "Inspect DNSKEY, DS, and RRSIG publication for an authorized domain without "
+                "claiming full resolver validation.",
+                _object_schema({"domain": string_target}, required=["domain"]),
+                self.dnssec_posture_analysis,
+            ),
+            self._spec(
+                "wildcard_dns_analysis",
+                "Detect wildcard DNS",
+                "Resolve up to five random, authorized labels beneath a domain to identify "
+                "wildcard DNS behavior.",
+                _object_schema(
+                    {
+                        "domain": string_target,
+                        "probe_count": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "maximum": 5,
+                            "default": 3,
+                        },
+                    },
+                    required=["domain"],
+                ),
+                self.wildcard_dns_analysis,
+            ),
+            self._spec(
+                "dangling_dns_analysis",
+                "Inspect dangling DNS aliases",
+                "Inspect CNAME targets and report unresolved aliases as takeover indicators "
+                "requiring manual verification.",
+                _object_schema({"domain": string_target}, required=["domain"]),
+                self.dangling_dns_analysis,
             ),
             self._spec(
                 "email_security_analysis",
@@ -558,11 +813,213 @@ class SecurityTools:
                 self.http_probe,
             ),
             self._spec(
+                "batch_http_probe",
+                "Probe multiple HTTP endpoints",
+                "Fetch metadata for up to 20 authorized HTTP(S) URLs with bounded concurrency "
+                "and per-target errors.",
+                _object_schema(
+                    {
+                        "urls": {
+                            "type": "array",
+                            "items": string_target,
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "uniqueItems": True,
+                        },
+                        "follow_redirects": {"type": "boolean", "default": True},
+                    },
+                    required=["urls"],
+                ),
+                self.batch_http_probe,
+            ),
+            self._spec(
                 "headers_analysis",
                 "Audit HTTP security headers",
                 "Analyze security and disclosure headers on one authorized HTTP endpoint.",
                 _object_schema({"url": string_target}, required=["url"]),
                 self.headers_analysis,
+            ),
+            self._spec(
+                "csp_analysis",
+                "Analyze Content Security Policy",
+                "Fetch an authorized endpoint and assess CSP directives for unsafe, missing, "
+                "duplicate, and deprecated controls.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.csp_analysis,
+            ),
+            self._spec(
+                "robots_txt_analysis",
+                "Analyze robots.txt",
+                "Fetch and summarize the RFC 9309 robots.txt file for an authorized origin "
+                "without crawling disclosed paths.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.robots_txt_analysis,
+            ),
+            self._spec(
+                "sitemap_analysis",
+                "Analyze a sitemap",
+                "Fetch a same-origin sitemap, inventory bounded URLs, and distinguish "
+                "authorized from external entries.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "sitemap_path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                            "default": "/sitemap.xml",
+                        },
+                    },
+                    required=["url"],
+                ),
+                self.sitemap_analysis,
+            ),
+            self._spec(
+                "technology_fingerprint",
+                "Fingerprint web technologies",
+                "Fingerprint likely frameworks, platforms, servers, and generators using "
+                "bounded response evidence.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.technology_fingerprint,
+            ),
+            self._spec(
+                "web_metadata_discovery",
+                "Discover web metadata",
+                "Probe a bounded set of standardized and conventional metadata paths on an "
+                "authorized origin.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "uniqueItems": True,
+                        },
+                    },
+                    required=["url"],
+                ),
+                self.web_metadata_discovery,
+            ),
+            self._spec(
+                "javascript_endpoint_discovery",
+                "Discover JavaScript endpoints",
+                "Inspect one authorized page or script plus a bounded set of same-scope "
+                "scripts for literal URL and path references.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "max_scripts": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 20,
+                            "default": 10,
+                        },
+                    },
+                    required=["url"],
+                ),
+                self.javascript_endpoint_discovery,
+            ),
+            self._spec(
+                "source_map_discovery",
+                "Discover JavaScript source maps",
+                "Inspect a bounded set of authorized JavaScript files for sourceMappingURL "
+                "references and check map availability without returning map contents.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "max_scripts": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "default": 10,
+                        },
+                    },
+                    required=["url"],
+                ),
+                self.source_map_discovery,
+            ),
+            self._spec(
+                "oauth_oidc_discovery",
+                "Discover OAuth and OpenID Connect metadata",
+                "Probe conventional same-origin discovery documents and summarize endpoints, "
+                "grants, response types, and PKCE support.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.oauth_oidc_discovery,
+            ),
+            self._spec(
+                "graphql_endpoint_discovery",
+                "Discover GraphQL endpoints",
+                "Send bounded read-only __typename probes to conventional or supplied "
+                "same-origin paths; optional introspection checks remain read-only.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "minItems": 1,
+                            "maxItems": 10,
+                            "uniqueItems": True,
+                        },
+                        "check_introspection": {"type": "boolean", "default": False},
+                    },
+                    required=["url"],
+                ),
+                self.graphql_endpoint_discovery,
+            ),
+            self._spec(
+                "sensitive_file_exposure_scan",
+                "Check sensitive file exposure",
+                "Issue HEAD requests for a small curated set of high-risk paths and report "
+                "candidates without reading their contents.",
+                _object_schema(
+                    {
+                        "url": string_target,
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "uniqueItems": True,
+                        },
+                    },
+                    required=["url"],
+                ),
+                self.sensitive_file_exposure_scan,
+            ),
+            self._spec(
+                "cache_policy_analysis",
+                "Analyze HTTP cache policy",
+                "Assess Cache-Control, Vary, validators, CDN signals, and sensitive-path "
+                "caching on one authorized response.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.cache_policy_analysis,
+            ),
+            self._spec(
+                "sri_analysis",
+                "Analyze Subresource Integrity",
+                "Inventory external script and stylesheet resources and measure Subresource "
+                "Integrity coverage.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.sri_analysis,
+            ),
+            self._spec(
+                "favicon_fingerprint",
+                "Fingerprint a favicon",
+                "Fetch a discovered or conventional same-scope favicon and return stable "
+                "hashes and metadata, never image bytes.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.favicon_fingerprint,
+            ),
+            self._spec(
+                "http_method_analysis",
+                "Analyze advertised HTTP methods",
+                "Send one OPTIONS request and assess advertised methods without attempting "
+                "state-changing methods.",
+                _object_schema({"url": string_target}, required=["url"]),
+                self.http_method_analysis,
             ),
             self._spec(
                 "cors_scan",
@@ -630,6 +1087,20 @@ class SecurityTools:
                     required=["target"],
                 ),
                 self.ssl_scan,
+            ),
+            self._spec(
+                "tls_configuration_analysis",
+                "Analyze TLS protocol support",
+                "Test TLS 1.0 through 1.3 support against scope-pinned addresses and identify "
+                "obsolete protocols.",
+                _object_schema(
+                    {
+                        "target": string_target,
+                        "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 443},
+                    },
+                    required=["target"],
+                ),
+                self.tls_configuration_analysis,
             ),
             self._spec(
                 "port_scan",
@@ -719,6 +1190,53 @@ class SecurityTools:
                     required=["target"],
                 ),
                 self.nuclei_scan,
+            ),
+            self._spec(
+                "subfinder_discovery",
+                "Run passive Subfinder discovery",
+                "Run the explicitly enabled Subfinder binary for one authorized domain and "
+                "retain only in-scope subdomains.",
+                _object_schema({"domain": string_target}, required=["domain"]),
+                self.subfinder_discovery,
+            ),
+            self._spec(
+                "amass_passive_discovery",
+                "Run passive Amass discovery",
+                "Run the explicitly enabled Amass passive enumeration mode and retain only "
+                "in-scope subdomains.",
+                _object_schema({"domain": string_target}, required=["domain"]),
+                self.amass_passive_discovery,
+            ),
+            self._spec(
+                "assetfinder_discovery",
+                "Run Assetfinder discovery",
+                "Run the explicitly enabled Assetfinder binary and retain only in-scope "
+                "subdomains.",
+                _object_schema({"domain": string_target}, required=["domain"]),
+                self.assetfinder_discovery,
+            ),
+            self._spec(
+                "gau_url_discovery",
+                "Run gau URL discovery",
+                "Run the explicitly enabled gau archive discovery binary and retain only "
+                "authorized HTTP(S) URLs.",
+                _object_schema(
+                    {
+                        "domain": string_target,
+                        "providers": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["wayback", "commoncrawl", "otx", "urlscan"],
+                            },
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "uniqueItems": True,
+                        },
+                    },
+                    required=["domain"],
+                ),
+                self.gau_url_discovery,
             ),
             self._spec(
                 "create_finding",
@@ -879,6 +1397,46 @@ class SecurityTools:
             "denied": len(decisions) - allowed,
         }
 
+    async def domain_variation_generator(
+        self,
+        domain: str,
+        maximum: int = 100,
+    ) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("domain_variation_generator requires a domain name")
+        variants = generate_domain_variants(parsed.host, maximum=maximum)
+        return {
+            "domain": parsed.host,
+            "variants": variants,
+            "count": len(variants),
+            "network_requests": 0,
+            "warning": (
+                "Candidates are generated only; registration, ownership, and scope are not implied."
+            ),
+        }
+
+    async def url_parameter_analysis(self, url: str) -> dict[str, Any]:
+        parsed = self.scope.require(url, require_url=True)
+        return analyze_url_parameters(parsed.normalized or url)
+
+    async def secret_pattern_analysis(self, content: str) -> dict[str, Any]:
+        return analyze_secret_patterns(content)
+
+    async def cloud_asset_reference_analysis(self, content: str) -> dict[str, Any]:
+        return analyze_cloud_references(content)
+
+    async def cvss_v31_calculator(self, vector: str) -> dict[str, Any]:
+        return calculate_cvss_v31(vector)
+
+    async def openapi_security_analysis(
+        self,
+        document: str,
+        document_format: str = "auto",
+    ) -> dict[str, Any]:
+        parsed = load_structured_document(document, document_format)
+        return analyze_openapi_document(parsed)
+
     async def dns_enumeration(
         self,
         domain: str,
@@ -912,6 +1470,151 @@ class SecurityTools:
                 record_type: {"values": values, "error": error}
                 for record_type, values, error in resolved
             },
+        }
+
+    async def _dns_values(self, name: str, record_type: str) -> tuple[list[str], str | None]:
+        await self.rate_limiter.wait()
+
+        def query() -> list[str]:
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = min(10.0, self.config.scanning.request_timeout)
+            return [str(answer).rstrip(".") for answer in resolver.resolve(name, record_type)]
+
+        try:
+            return await asyncio.to_thread(query), None
+        except (dns.exception.DNSException, OSError) as exc:
+            return [], exc.__class__.__name__
+
+    async def dnssec_posture_analysis(self, domain: str) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("dnssec_posture_analysis requires a domain name")
+        record_types = ("DNSKEY", "DS", "RRSIG")
+        answers = await asyncio.gather(
+            *(self._dns_values(parsed.host, record_type) for record_type in record_types)
+        )
+        records = {
+            record_type: {"values": values, "error": error}
+            for record_type, (values, error) in zip(record_types, answers, strict=True)
+        }
+        signed = bool(records["DNSKEY"]["values"] or records["DS"]["values"])
+        findings: list[dict[str, str]] = []
+        if not signed:
+            findings.append(
+                {"severity": "info", "issue": "no DNSKEY or DS publication was observed"}
+            )
+        elif not records["DS"]["values"]:
+            findings.append(
+                {
+                    "severity": "low",
+                    "issue": "DNSKEY exists but no DS record was observed at the delegation",
+                }
+            )
+        return {
+            "domain": parsed.host,
+            "records": records,
+            "signed": signed,
+            "findings": findings,
+            "finding_count": len(findings),
+            "validation_performed": False,
+            "note": (
+                "Record publication is inspected; a complete chain-of-trust validation is "
+                "not performed."
+            ),
+        }
+
+    async def wildcard_dns_analysis(
+        self,
+        domain: str,
+        probe_count: int = 3,
+    ) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("wildcard_dns_analysis requires a domain name")
+        probes: list[dict[str, Any]] = []
+        signatures: Counter[tuple[str, ...]] = Counter()
+        for _index in range(probe_count):
+            candidate = f"bbmcp-{secrets.token_hex(8)}.{parsed.host}"
+            self.scope.require(candidate)
+            addresses_a, error_a = await self._dns_values(candidate, "A")
+            addresses_aaaa, error_aaaa = await self._dns_values(candidate, "AAAA")
+            addresses = sorted(set(addresses_a + addresses_aaaa))
+            if not self.config.allow_private_targets:
+                non_public = [
+                    address for address in addresses if not ipaddress.ip_address(address).is_global
+                ]
+                if non_public:
+                    raise ScopeViolation(
+                        "wildcard probe resolved to disallowed non-public address(es): "
+                        + ", ".join(non_public)
+                    )
+            if addresses:
+                signature = tuple(addresses)
+                signatures[signature] += 1
+                probes.append(
+                    {"hostname": candidate, "addresses": list(signature), "resolved": True}
+                )
+            else:
+                probes.append(
+                    {
+                        "hostname": candidate,
+                        "addresses": [],
+                        "resolved": False,
+                        "errors": sorted({error for error in (error_a, error_aaaa) if error}),
+                    }
+                )
+        repeated = max(signatures.values(), default=0)
+        wildcard_detected = repeated >= 2
+        return {
+            "domain": parsed.host,
+            "wildcard_detected": wildcard_detected,
+            "probes": probes,
+            "consistent_answer_count": repeated,
+            "confidence": "high"
+            if repeated == probe_count
+            else "medium"
+            if wildcard_detected
+            else "firm",
+        }
+
+    async def dangling_dns_analysis(self, domain: str) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("dangling_dns_analysis requires a domain name")
+        cname_records, cname_error = await self._dns_values(parsed.host, "CNAME")
+        checks = []
+        dangling = False
+        for cname in cname_records[:20]:
+            addresses_a, error_a = await self._dns_values(cname, "A")
+            addresses_aaaa, error_aaaa = await self._dns_values(cname, "AAAA")
+            resolved = bool(addresses_a or addresses_aaaa)
+            dangling |= not resolved
+            checks.append(
+                {
+                    "target": cname,
+                    "resolved": resolved,
+                    "address_count": len(addresses_a) + len(addresses_aaaa),
+                    "errors": sorted({error for error in (error_a, error_aaaa) if error}),
+                }
+            )
+        return {
+            "domain": parsed.host,
+            "cname_records": cname_records,
+            "cname_error": cname_error,
+            "checks": checks,
+            "dangling": dangling,
+            "finding": (
+                {
+                    "severity": "medium",
+                    "issue": (
+                        "one or more CNAME targets did not resolve; manually verify provider "
+                        "ownership"
+                    ),
+                }
+                if dangling
+                else None
+            ),
+            "note": "An unresolved CNAME is an indicator, not proof of subdomain takeover.",
         }
 
     async def email_security_analysis(self, domain: str) -> dict[str, Any]:
@@ -1170,6 +1873,17 @@ class SecurityTools:
                     ) from exc
         raise ToolExecutionError("HTTP request did not produce a response", code="http_error")
 
+    @staticmethod
+    def _response_text(response: HTTPResponse) -> str:
+        charset = "utf-8"
+        match = re.search(r"charset=([^;\s]+)", response.content_type, re.I)
+        if match:
+            charset = match.group(1).strip("\"'")
+        try:
+            return response.body.decode(charset, errors="replace")
+        except LookupError:
+            return response.body.decode("utf-8", errors="replace")
+
     def _inspect_html(self, response: HTTPResponse) -> _HTMLInspector:
         inspector = _HTMLInspector(
             max_links=self.config.scanning.max_links_per_page,
@@ -1177,15 +1891,7 @@ class SecurityTools:
         )
         if "html" not in response.content_type.lower() or not response.body:
             return inspector
-        charset = "utf-8"
-        match = re.search(r"charset=([^;\s]+)", response.content_type, re.I)
-        if match:
-            charset = match.group(1).strip("\"'")
-        try:
-            content = response.body.decode(charset, errors="replace")
-        except LookupError:
-            content = response.body.decode("utf-8", errors="replace")
-        inspector.feed(content)
+        inspector.feed(self._response_text(response))
         return inspector
 
     @staticmethod
@@ -1242,6 +1948,32 @@ class SecurityTools:
                 name for name in response.headers if name in _SENSITIVE_RESPONSE_HEADERS
             ),
             "set_cookie_count": len(response.set_cookies),
+        }
+
+    async def batch_http_probe(
+        self,
+        urls: list[str],
+        follow_redirects: bool = True,
+    ) -> dict[str, Any]:
+        async def probe(url: str) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+            try:
+                return await self.http_probe(url, follow_redirects=follow_redirects), None
+            except (ToolExecutionError, ScopeViolation) as exc:
+                return None, {"url": url, "error": str(exc)}
+
+        entries = await bounded_map(
+            urls,
+            probe,
+            concurrency=min(self.config.scanning.max_concurrency, 10),
+        )
+        results = [result for result, _error in entries if result is not None]
+        errors = [error for _result, error in entries if error is not None]
+        return {
+            "results": results,
+            "count": len(results),
+            "errors": errors,
+            "error_count": len(errors),
+            "requested": len(urls),
         }
 
     async def headers_analysis(self, url: str) -> dict[str, Any]:
@@ -1320,6 +2052,648 @@ class SecurityTools:
             "controls": controls,
             "findings": findings,
             "information_disclosure": disclosures,
+        }
+
+    async def csp_analysis(self, url: str) -> dict[str, Any]:
+        response = await self._fetch(url)
+        enforced = response.headers.get("content-security-policy")
+        report_only = response.headers.get("content-security-policy-report-only")
+        if not enforced:
+            findings = [
+                {
+                    "severity": "medium",
+                    "issue": (
+                        "only a report-only policy is present"
+                        if report_only
+                        else "Content-Security-Policy is missing"
+                    ),
+                }
+            ]
+            return {
+                "url": response.final_url,
+                "present": False,
+                "report_only_present": bool(report_only),
+                "directives": {},
+                "directive_count": 0,
+                "findings": findings,
+                "finding_count": len(findings),
+            }
+        result = analyze_csp(enforced)
+        return {
+            "url": response.final_url,
+            "present": True,
+            "report_only_present": bool(report_only),
+            **result,
+        }
+
+    async def robots_txt_analysis(self, url: str) -> dict[str, Any]:
+        parsed = await self.scope.require_network_safe(url, require_url=True)
+        split = urlsplit(parsed.normalized or url)
+        robots_url = f"{split.scheme}://{split.netloc}/robots.txt"
+        response = await self._fetch(robots_url)
+        present = response.status == 200 and bool(response.body)
+        parsed_content = (
+            parse_robots(self._response_text(response))
+            if present
+            else {
+                "groups": [],
+                "group_count": 0,
+                "rule_count": 0,
+                "sitemaps": [],
+                "malformed_lines": 0,
+                "truncated": False,
+            }
+        )
+        return {
+            "url": response.final_url,
+            "status": response.status,
+            "present": present,
+            "content_sha256": stable_hash(response.body) if present else None,
+            "content_type": response.content_type,
+            **parsed_content,
+        }
+
+    async def sitemap_analysis(
+        self,
+        url: str,
+        sitemap_path: str = "/sitemap.xml",
+    ) -> dict[str, Any]:
+        base = await self.scope.require_network_safe(url, require_url=True)
+        if "://" in sitemap_path:
+            raise ValueError("sitemap_path must be relative to the authorized origin")
+        split = urlsplit(base.normalized or url)
+        origin = f"{split.scheme}://{split.netloc}/"
+        sitemap_url = urljoin(origin, quote(sitemap_path.lstrip("/"), safe="/._~-"))
+        response = await self._fetch(sitemap_url)
+        present = response.status == 200 and bool(response.body)
+        discovered: list[dict[str, Any]] = []
+        external_count = 0
+        if present:
+            content = self._response_text(response)
+            matches = re.findall(
+                r"<(?:[A-Za-z0-9_-]+:)?loc\b[^>]*>(.*?)</(?:[A-Za-z0-9_-]+:)?loc\s*>",
+                content,
+                re.I | re.S,
+            )
+            for raw_value in matches[:1000]:
+                candidate = unescape(raw_value).strip()
+                if not candidate:
+                    continue
+                decision = self.scope.evaluate(candidate)
+                if decision.allowed:
+                    discovered.append(
+                        {
+                            "url": decision.target.normalized if decision.target else candidate,
+                            "authorized": True,
+                        }
+                    )
+                else:
+                    external_count += 1
+        return {
+            "url": response.final_url,
+            "status": response.status,
+            "present": present,
+            "urls": discovered,
+            "url_count": len(discovered),
+            "external_or_unauthorized_count": external_count,
+            "truncated": present and len(matches) > 1000,
+            "content_sha256": stable_hash(response.body) if present else None,
+        }
+
+    async def technology_fingerprint(self, url: str) -> dict[str, Any]:
+        response = await self._fetch(url)
+        inspector = self._inspect_html(response)
+        detected = set(self._detect_technologies(response, inspector))
+        content = self._response_text(response).lower()
+        matched_body_markers = []
+        for marker, technology in _TECHNOLOGY_BODY_MARKERS.items():
+            if marker in content:
+                detected.add(technology)
+                matched_body_markers.append(marker)
+        cookie_names: list[str] = []
+        for raw_cookie in response.set_cookies[:100]:
+            parsed_cookie = SimpleCookie()
+            try:
+                parsed_cookie.load(raw_cookie)
+            except Exception:  # SimpleCookie may surface multiple parsing exceptions.
+                logger.debug("could not parse response cookie name")
+                continue
+            cookie_names.extend(parsed_cookie.keys())
+        cookie_markers = {
+            "phpsessid": "PHP",
+            "jsessionid": "Java/Jakarta EE",
+            "asp.net_sessionid": "ASP.NET",
+            "laravel_session": "Laravel",
+            "csrftoken": "Django",
+        }
+        for cookie_name in cookie_names:
+            if cookie_name.lower() in cookie_markers:
+                detected.add(cookie_markers[cookie_name.lower()])
+        return {
+            "url": response.final_url,
+            "status": response.status,
+            "technologies": sorted(detected),
+            "evidence": {
+                "server": response.headers.get("server"),
+                "x_powered_by": response.headers.get("x-powered-by"),
+                "generators": inspector.generators,
+                "script_count": len(inspector.scripts),
+                "body_markers": sorted(matched_body_markers),
+                "cookie_names": sorted(set(cookie_names)),
+            },
+            "confidence": "heuristic",
+        }
+
+    async def web_metadata_discovery(
+        self,
+        url: str,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        base = await self.scope.require_network_safe(url, require_url=True)
+        split = urlsplit(base.normalized or url)
+        origin = f"{split.scheme}://{split.netloc}"
+        candidates = paths or _WELL_KNOWN_PATHS
+        results = []
+        for path in candidates:
+            if "://" in path:
+                raise ValueError("metadata paths must be relative to the authorized origin")
+            candidate = urljoin(origin + "/", quote(path.lstrip("/"), safe="/._~-"))
+            try:
+                response = await self._fetch(candidate, method="HEAD", follow_redirects=False)
+                if response.status not in {404, 410}:
+                    results.append(
+                        {
+                            "path": path,
+                            "url": candidate,
+                            "status": response.status,
+                            "content_type": response.content_type,
+                            "content_length": response.headers.get("content-length"),
+                        }
+                    )
+            except ToolExecutionError as exc:
+                results.append({"path": path, "url": candidate, "error": str(exc)})
+        return {
+            "origin": origin,
+            "results": results,
+            "found_count": sum("status" in result for result in results),
+            "requests": len(candidates),
+        }
+
+    async def javascript_endpoint_discovery(
+        self,
+        url: str,
+        max_scripts: int = 10,
+    ) -> dict[str, Any]:
+        primary = await self._fetch(url)
+        inspector = self._inspect_html(primary)
+        source_urls = [primary.final_url]
+        for raw_script in inspector.scripts:
+            candidate = urljoin(primary.final_url, raw_script)
+            if self.scope.evaluate(candidate).allowed and candidate not in source_urls:
+                source_urls.append(candidate)
+            if len(source_urls) >= max_scripts + 1:
+                break
+
+        endpoints: dict[str, dict[str, Any]] = {}
+        errors: list[dict[str, str]] = []
+        for source_url in source_urls:
+            try:
+                response = (
+                    primary if source_url == primary.final_url else await self._fetch(source_url)
+                )
+            except ToolExecutionError as exc:
+                errors.append({"url": source_url, "error": str(exc)})
+                continue
+            extracted = extract_javascript_endpoints(self._response_text(response))
+            for item in extracted["endpoints"]:
+                raw_endpoint = item["value"]
+                candidate = urljoin(response.final_url, raw_endpoint)
+                scope_candidate = re.sub(r"^ws(s)?://", r"http\1://", candidate, flags=re.I)
+                decision = self.scope.evaluate(scope_candidate)
+                if decision.allowed:
+                    endpoints.setdefault(
+                        candidate,
+                        {
+                            "url": candidate,
+                            "kind": item["kind"],
+                            "source": response.final_url,
+                        },
+                    )
+                if len(endpoints) >= 1000:
+                    break
+            if len(endpoints) >= 1000:
+                break
+        return {
+            "url": primary.final_url,
+            "endpoints": list(endpoints.values()),
+            "endpoint_count": len(endpoints),
+            "scripts_inspected": len(source_urls),
+            "errors": errors,
+            "truncated": len(endpoints) >= 1000,
+        }
+
+    async def source_map_discovery(
+        self,
+        url: str,
+        max_scripts: int = 10,
+    ) -> dict[str, Any]:
+        primary = await self._fetch(url)
+        inspector = self._inspect_html(primary)
+        is_javascript = (
+            "javascript" in primary.content_type.lower()
+            or primary.final_url.lower().endswith((".js", ".mjs"))
+        )
+        script_urls = [primary.final_url] if is_javascript else []
+        for raw_script in inspector.scripts:
+            candidate = urljoin(primary.final_url, raw_script)
+            if self.scope.evaluate(candidate).allowed and candidate not in script_urls:
+                script_urls.append(candidate)
+            if len(script_urls) >= max_scripts:
+                break
+
+        source_maps: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for script_url in script_urls:
+            try:
+                script_response = (
+                    primary if script_url == primary.final_url else await self._fetch(script_url)
+                )
+            except ToolExecutionError as exc:
+                errors.append({"url": script_url, "error": str(exc)})
+                continue
+            references = re.findall(
+                r"[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)",
+                self._response_text(script_response),
+            )
+            if not references:
+                references = [script_response.final_url + ".map"]
+            for raw_reference in references[:5]:
+                if raw_reference.lower().startswith("data:"):
+                    source_maps.append(
+                        {"script": script_response.final_url, "inline": True, "available": True}
+                    )
+                    continue
+                candidate = urljoin(script_response.final_url, raw_reference.strip("'\""))
+                if not self.scope.evaluate(candidate).allowed:
+                    continue
+                try:
+                    map_response = await self._fetch(
+                        candidate,
+                        method="HEAD",
+                        follow_redirects=False,
+                    )
+                    source_maps.append(
+                        {
+                            "script": script_response.final_url,
+                            "url": candidate,
+                            "inline": False,
+                            "status": map_response.status,
+                            "available": map_response.status == 200,
+                            "content_length": map_response.headers.get("content-length"),
+                        }
+                    )
+                except ToolExecutionError as exc:
+                    errors.append({"url": candidate, "error": str(exc)})
+        return {
+            "url": primary.final_url,
+            "source_maps": source_maps,
+            "count": len(source_maps),
+            "available_count": sum(bool(item["available"]) for item in source_maps),
+            "scripts_inspected": len(script_urls),
+            "errors": errors,
+        }
+
+    async def oauth_oidc_discovery(self, url: str) -> dict[str, Any]:
+        base = await self.scope.require_network_safe(url, require_url=True)
+        split = urlsplit(base.normalized or url)
+        origin = f"{split.scheme}://{split.netloc}"
+        paths = [
+            "/.well-known/openid-configuration",
+            "/.well-known/oauth-authorization-server",
+        ]
+        documents: list[dict[str, Any]] = []
+        attempts: list[dict[str, Any]] = []
+        for path in paths:
+            candidate = origin + path
+            try:
+                response = await self._fetch(candidate)
+            except ToolExecutionError as exc:
+                attempts.append({"url": candidate, "error": str(exc)})
+                continue
+            attempts.append({"url": candidate, "status": response.status})
+            if response.status != 200 or response.truncated or not response.body:
+                continue
+            try:
+                document = load_structured_document(self._response_text(response), "json")
+            except ValueError:
+                continue
+            if not isinstance(document, dict) or not document.get("issuer"):
+                continue
+            endpoint_names = [
+                "authorization_endpoint",
+                "token_endpoint",
+                "userinfo_endpoint",
+                "jwks_uri",
+                "registration_endpoint",
+                "revocation_endpoint",
+                "introspection_endpoint",
+                "end_session_endpoint",
+            ]
+            endpoints = {}
+            for name in endpoint_names:
+                value = document.get(name)
+                if isinstance(value, str):
+                    endpoints[name] = {
+                        "url": value[:2048],
+                        "authorized_scope": self.scope.evaluate(value).allowed,
+                    }
+            methods = document.get("code_challenge_methods_supported")
+            documents.append(
+                {
+                    "url": response.final_url,
+                    "issuer": str(document["issuer"])[:2048],
+                    "endpoints": endpoints,
+                    "grant_types_supported": document.get("grant_types_supported", [])[:100]
+                    if isinstance(document.get("grant_types_supported"), list)
+                    else [],
+                    "response_types_supported": document.get("response_types_supported", [])[:100]
+                    if isinstance(document.get("response_types_supported"), list)
+                    else [],
+                    "pkce_methods_supported": methods[:20] if isinstance(methods, list) else [],
+                    "s256_pkce_supported": isinstance(methods, list) and "S256" in methods,
+                    "content_sha256": stable_hash(response.body),
+                }
+            )
+        return {
+            "origin": origin,
+            "documents": documents,
+            "document_count": len(documents),
+            "attempts": attempts,
+        }
+
+    async def graphql_endpoint_discovery(
+        self,
+        url: str,
+        paths: list[str] | None = None,
+        check_introspection: bool = False,
+    ) -> dict[str, Any]:
+        base = await self.scope.require_network_safe(url, require_url=True)
+        split = urlsplit(base.normalized or url)
+        origin = f"{split.scheme}://{split.netloc}"
+        candidates = paths or _GRAPHQL_PATHS
+        endpoints: list[dict[str, Any]] = []
+        attempts: list[dict[str, Any]] = []
+        query = "{__schema{queryType{name}}}" if check_introspection else "{__typename}"
+        for path in candidates:
+            if "://" in path:
+                raise ValueError("GraphQL paths must be relative to the authorized origin")
+            endpoint = urljoin(origin + "/", quote(path.lstrip("/"), safe="/._~-"))
+            candidate = endpoint + "?" + urlencode({"query": query})
+            try:
+                response = await self._fetch(candidate, follow_redirects=False)
+            except ToolExecutionError as exc:
+                attempts.append({"url": endpoint, "error": str(exc)})
+                continue
+            attempts.append({"url": endpoint, "status": response.status})
+            body = self._response_text(response)
+            graphql_signal = (
+                "application/json" in response.content_type.lower()
+                and ('"data"' in body or '"errors"' in body)
+            ) or any(marker in body.lower() for marker in ("graphql", "__typename", "querytype"))
+            if graphql_signal:
+                endpoints.append(
+                    {
+                        "url": endpoint,
+                        "status": response.status,
+                        "content_type": response.content_type,
+                        "introspection_checked": check_introspection,
+                        "introspection_enabled": check_introspection
+                        and "querytype" in body.lower(),
+                        "response_sha256": stable_hash(response.body),
+                    }
+                )
+        return {
+            "origin": origin,
+            "endpoints": endpoints,
+            "endpoint_count": len(endpoints),
+            "attempts": attempts,
+            "query_type": "introspection" if check_introspection else "typename",
+        }
+
+    async def sensitive_file_exposure_scan(
+        self,
+        url: str,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        base = await self.scope.require_network_safe(url, require_url=True)
+        split = urlsplit(base.normalized or url)
+        origin = f"{split.scheme}://{split.netloc}"
+        candidates = paths or list(_SENSITIVE_EXPOSURE_PATHS)
+        results = []
+        for path in candidates:
+            if "://" in path:
+                raise ValueError("sensitive-file paths must be relative to the authorized origin")
+            candidate = urljoin(origin + "/", quote(path.lstrip("/"), safe="/._~-"))
+            severity, description = _SENSITIVE_EXPOSURE_PATHS.get(
+                "/" + path.lstrip("/"), ("medium", "user-supplied sensitive path")
+            )
+            try:
+                response = await self._fetch(candidate, method="HEAD", follow_redirects=False)
+                potentially_exposed = response.status in {200, 206}
+                if response.status not in {404, 410}:
+                    results.append(
+                        {
+                            "url": candidate,
+                            "path": path,
+                            "status": response.status,
+                            "severity": severity,
+                            "description": description,
+                            "potentially_exposed": potentially_exposed,
+                            "content_type": response.content_type,
+                            "content_length": response.headers.get("content-length"),
+                        }
+                    )
+            except ToolExecutionError as exc:
+                results.append({"url": candidate, "path": path, "error": str(exc)})
+        return {
+            "origin": origin,
+            "results": results,
+            "finding_count": sum(bool(item.get("potentially_exposed")) for item in results),
+            "requests": len(candidates),
+            "body_content_read": False,
+            "warning": (
+                "HEAD/status signals can be false positives and require manual confirmation."
+            ),
+        }
+
+    async def cache_policy_analysis(self, url: str) -> dict[str, Any]:
+        response = await self._fetch(url)
+        headers = response.headers
+        raw_cache_control = headers.get("cache-control", "")
+        directives = {
+            part.strip().lower().split("=", 1)[0]: (
+                part.strip().split("=", 1)[1] if "=" in part else True
+            )
+            for part in raw_cache_control.split(",")
+            if part.strip()
+        }
+        cacheable = not any(name in directives for name in ("no-store", "private"))
+        split = urlsplit(response.final_url)
+        sensitive_path = bool(
+            re.search(
+                r"/(?:account|admin|auth|login|profile|settings|user)(?:/|$)", split.path, re.I
+            )
+        )
+        findings: list[dict[str, str]] = []
+        if not raw_cache_control:
+            findings.append({"severity": "low", "issue": "Cache-Control is missing"})
+        if sensitive_path and cacheable:
+            findings.append(
+                {
+                    "severity": "medium",
+                    "issue": "a potentially sensitive path is not marked private or no-store",
+                }
+            )
+        if "public" in directives and response.set_cookies:
+            findings.append({"severity": "medium", "issue": "a public response also sets cookies"})
+        vary = [item.strip().lower() for item in headers.get("vary", "").split(",") if item.strip()]
+        if "*" in vary:
+            findings.append({"severity": "low", "issue": "Vary: * prevents normal cache reuse"})
+        return {
+            "url": response.final_url,
+            "status": response.status,
+            "cacheable": cacheable,
+            "directives": directives,
+            "vary": vary,
+            "validators": {
+                "etag": bool(headers.get("etag")),
+                "last_modified": bool(headers.get("last-modified")),
+            },
+            "cache_signals": {
+                key: headers[key]
+                for key in ("age", "cf-cache-status", "x-cache", "x-cache-hits", "x-served-by")
+                if key in headers
+            },
+            "findings": findings,
+            "finding_count": len(findings),
+        }
+
+    async def sri_analysis(self, url: str) -> dict[str, Any]:
+        response = await self._fetch(url)
+        inspector = self._inspect_html(response)
+        page_host = urlsplit(response.final_url).hostname
+        resources = []
+        external_count = 0
+        protected_external_count = 0
+        for resource in inspector.resources[:1000]:
+            absolute = urljoin(response.final_url, resource["url"])
+            external = urlsplit(absolute).hostname != page_host
+            integrity = resource.get("integrity")
+            if external:
+                external_count += 1
+                protected_external_count += bool(integrity)
+            resources.append(
+                {
+                    "url": absolute,
+                    "tag": resource["tag"],
+                    "external": external,
+                    "integrity_present": bool(integrity),
+                    "integrity_algorithms": sorted(
+                        {
+                            token.split("-", 1)[0].lower()
+                            for token in str(integrity or "").split()
+                            if "-" in token
+                        }
+                    ),
+                    "crossorigin": resource.get("crossorigin"),
+                }
+            )
+        coverage = (
+            round((protected_external_count / external_count) * 100, 2) if external_count else 100.0
+        )
+        return {
+            "url": response.final_url,
+            "resources": resources,
+            "resource_count": len(resources),
+            "external_resource_count": external_count,
+            "protected_external_count": protected_external_count,
+            "coverage_percent": coverage,
+            "findings": [
+                {
+                    "severity": "low",
+                    "issue": (
+                        f"{external_count - protected_external_count} external resource(s) "
+                        "lack integrity metadata"
+                    ),
+                }
+            ]
+            if external_count > protected_external_count
+            else [],
+        }
+
+    async def favicon_fingerprint(self, url: str) -> dict[str, Any]:
+        page = await self._fetch(url)
+        inspector = self._inspect_html(page)
+        candidates = [urljoin(page.final_url, icon) for icon in inspector.icons]
+        split = urlsplit(page.final_url)
+        candidates.append(f"{split.scheme}://{split.netloc}/favicon.ico")
+        attempts: list[dict[str, Any]] = []
+        for candidate in list(dict.fromkeys(candidates))[:20]:
+            if not self.scope.evaluate(candidate).allowed:
+                attempts.append({"url": candidate, "skipped": "outside authorized scope"})
+                continue
+            try:
+                response = await self._fetch(candidate)
+            except ToolExecutionError as exc:
+                attempts.append({"url": candidate, "error": str(exc)})
+                continue
+            attempts.append({"url": candidate, "status": response.status})
+            if response.status == 200 and response.body:
+                return {
+                    "url": response.final_url,
+                    "found": True,
+                    "attempts": attempts,
+                    "content_type": response.content_type,
+                    "size": len(response.body),
+                    "sha256": stable_hash(response.body),
+                    "body_truncated": response.truncated,
+                }
+        return {"url": page.final_url, "found": False, "attempts": attempts}
+
+    async def http_method_analysis(self, url: str) -> dict[str, Any]:
+        response = await self._fetch(url, method="OPTIONS", follow_redirects=False)
+        raw_methods = response.headers.get("allow", "")
+        cors_methods = response.headers.get("access-control-allow-methods", "")
+        methods = sorted(
+            {
+                method.strip().upper()
+                for source in (raw_methods, cors_methods)
+                for method in source.split(",")
+                if method.strip()
+            }
+        )
+        dangerous = sorted(set(methods) & {"CONNECT", "DELETE", "PATCH", "PUT", "TRACE"})
+        findings = (
+            [
+                {
+                    "severity": "info",
+                    "issue": (
+                        "state-changing or diagnostic methods are advertised; authorization "
+                        "must be verified manually"
+                    ),
+                    "methods": dangerous,
+                }
+            ]
+            if dangerous
+            else []
+        )
+        return {
+            "url": response.final_url,
+            "status": response.status,
+            "allowed_methods": methods,
+            "potentially_dangerous_methods": dangerous,
+            "findings": findings,
+            "state_changing_requests_sent": False,
         }
 
     async def cors_scan(
@@ -1683,6 +3057,79 @@ class SecurityTools:
                 f"TLS inspection failed: {exc.__class__.__name__}: {exc}", code="tls_error"
             ) from exc
 
+    async def tls_configuration_analysis(
+        self,
+        target: str,
+        port: int = 443,
+    ) -> dict[str, Any]:
+        parsed, addresses = await self.scope.resolve_network_safe(target)
+        host = parsed.host
+        port = parsed.port or port
+        versions = [
+            ("TLSv1.0", ssl.TLSVersion.TLSv1),
+            ("TLSv1.1", ssl.TLSVersion.TLSv1_1),
+            ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
+            ("TLSv1.3", ssl.TLSVersion.TLSv1_3),
+        ]
+
+        def inspect_version(label: str, version: ssl.TLSVersion) -> dict[str, Any]:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            try:
+                context.minimum_version = version
+                context.maximum_version = version
+            except ValueError as exc:
+                return {"version": label, "supported": False, "error": exc.__class__.__name__}
+            last_error: BaseException | None = None
+            for address in addresses:
+                try:
+                    with socket.create_connection(
+                        (address, port), timeout=self.config.scanning.connect_timeout
+                    ) as raw_socket:
+                        with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+                            cipher = tls_socket.cipher()
+                            return {
+                                "version": label,
+                                "supported": True,
+                                "negotiated": tls_socket.version(),
+                                "cipher": cipher[0] if cipher else None,
+                                "address": address,
+                            }
+                except (OSError, ssl.SSLError, ValueError) as exc:
+                    last_error = exc
+            return {
+                "version": label,
+                "supported": False,
+                "error": last_error.__class__.__name__ if last_error else "ConnectionError",
+            }
+
+        protocols = await asyncio.gather(
+            *(asyncio.to_thread(inspect_version, label, version) for label, version in versions)
+        )
+        supported = {item["version"] for item in protocols if item["supported"]}
+        findings: list[dict[str, str]] = []
+        obsolete = sorted(supported & {"TLSv1.0", "TLSv1.1"})
+        if obsolete:
+            findings.append(
+                {
+                    "severity": "medium",
+                    "issue": "obsolete TLS protocols are supported: " + ", ".join(obsolete),
+                }
+            )
+        if not supported & {"TLSv1.2", "TLSv1.3"}:
+            findings.append(
+                {"severity": "high", "issue": "neither TLS 1.2 nor TLS 1.3 was negotiated"}
+            )
+        return {
+            "target": host,
+            "port": port,
+            "protocols": list(protocols),
+            "supported_protocols": sorted(supported),
+            "findings": findings,
+            "finding_count": len(findings),
+        }
+
     async def port_scan(self, target: str, ports: str | None = None) -> dict[str, Any]:
         parsed, addresses = await self.scope.resolve_network_safe(target)
         selected = parse_ports(
@@ -2039,6 +3486,185 @@ class SecurityTools:
             },
         }
 
+    def _external_binary(self, name: str) -> str:
+        if name not in self.config.tools.enabled_external_tools:
+            raise ToolExecutionError(
+                f"{name} is disabled; add it to ENABLED_EXTERNAL_TOOLS after reviewing its "
+                "data sources and terms",
+                code="tool_disabled",
+            )
+        configured_path = str(getattr(self.config.tools, f"{name}_path"))
+        binary = shutil.which(configured_path)
+        if binary is None:
+            raise ToolExecutionError(
+                f"{name} binary was not found: {configured_path}",
+                code="dependency_missing",
+            )
+        return binary
+
+    def _filter_external_domains(self, domain: str, output: str) -> list[str]:
+        found: set[str] = set()
+        for line in output.splitlines()[:100_000]:
+            candidate = line.strip().lower().rstrip(".")
+            if not candidate or len(candidate) > 253 or "://" in candidate:
+                continue
+            try:
+                parsed = parse_target(candidate)
+            except ValueError:
+                continue
+            if parsed.kind != "domain":
+                continue
+            if parsed.host != domain and not parsed.host.endswith(f".{domain}"):
+                continue
+            if self.scope.evaluate(parsed.host).allowed:
+                found.add(parsed.host)
+            if len(found) >= 20_000:
+                break
+        return sorted(found)
+
+    async def _run_passive_domain_tool(
+        self,
+        name: str,
+        domain: str,
+        command: list[str],
+    ) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError(f"{name} requires a domain name")
+        result = await run_command_async(
+            command,
+            timeout=min(self.config.tool_timeout, 900),
+            max_output_bytes=10_000_000,
+        )
+        subdomains = self._filter_external_domains(parsed.host, result["stdout"])
+        if not result["success"] and not subdomains:
+            raise ToolExecutionError(
+                f"{name} failed: {result['stderr'][:2000] or 'unknown error'}",
+                code="external_tool_failed",
+            )
+        return {
+            "domain": parsed.host,
+            "subdomains": subdomains,
+            "count": len(subdomains),
+            "source": name,
+            "scope_filtered": True,
+            "process": {
+                "returncode": result["returncode"],
+                "timed_out": result["timed_out"],
+                "output_truncated": result["stdout_truncated"] or result["stderr_truncated"],
+            },
+        }
+
+    async def subfinder_discovery(self, domain: str) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("subfinder requires a domain name")
+        binary = self._external_binary("subfinder")
+        timeout_seconds = max(1, min(math.ceil(self.config.scanning.request_timeout), 60))
+        max_minutes = max(1, min(math.ceil(self.config.tool_timeout / 60), 15))
+        return await self._run_passive_domain_tool(
+            "subfinder",
+            parsed.host,
+            [
+                binary,
+                "-d",
+                parsed.host,
+                "-silent",
+                "-disable-update-check",
+                "-timeout",
+                str(timeout_seconds),
+                "-max-time",
+                str(max_minutes),
+            ],
+        )
+
+    async def amass_passive_discovery(self, domain: str) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("amass requires a domain name")
+        binary = self._external_binary("amass")
+        return await self._run_passive_domain_tool(
+            "amass",
+            parsed.host,
+            [
+                binary,
+                "enum",
+                "-passive",
+                "-d",
+                parsed.host,
+            ],
+        )
+
+    async def assetfinder_discovery(self, domain: str) -> dict[str, Any]:
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("assetfinder requires a domain name")
+        binary = self._external_binary("assetfinder")
+        return await self._run_passive_domain_tool(
+            "assetfinder",
+            parsed.host,
+            [binary, "--subs-only", parsed.host],
+        )
+
+    async def gau_url_discovery(
+        self,
+        domain: str,
+        providers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        binary = self._external_binary("gau")
+        parsed = self.scope.require(domain)
+        if parsed.kind != "domain":
+            raise ValueError("gau requires a domain name")
+        command = [binary]
+        if providers:
+            command.extend(["--providers", ",".join(providers)])
+        command.extend(
+            [
+                "--threads",
+                str(min(self.config.scanning.max_concurrency, 10)),
+                "--timeout",
+                str(max(1, math.ceil(self.config.scanning.request_timeout))),
+                "--retries",
+                "1",
+            ]
+        )
+        command.append(parsed.host)
+        result = await run_command_async(
+            command,
+            timeout=min(self.config.tool_timeout, 900),
+            max_output_bytes=10_000_000,
+        )
+        urls: set[str] = set()
+        rejected = 0
+        for line in result["stdout"].splitlines()[:100_000]:
+            candidate = line.strip()
+            if not candidate:
+                continue
+            decision = self.scope.evaluate(candidate)
+            if decision.allowed and decision.target and decision.target.scheme in {"http", "https"}:
+                urls.add(decision.target.normalized or candidate)
+            else:
+                rejected += 1
+            if len(urls) >= 20_000:
+                break
+        if not result["success"] and not urls:
+            raise ToolExecutionError(
+                f"gau failed: {result['stderr'][:2000] or 'unknown error'}",
+                code="external_tool_failed",
+            )
+        return {
+            "domain": parsed.host,
+            "urls": sorted(urls),
+            "count": len(urls),
+            "rejected_out_of_scope": rejected,
+            "scope_filtered": True,
+            "process": {
+                "returncode": result["returncode"],
+                "timed_out": result["timed_out"],
+                "output_truncated": result["stdout_truncated"] or result["stderr_truncated"],
+            },
+        }
+
     async def create_finding(
         self,
         title: str,
@@ -2152,6 +3778,14 @@ class SecurityTools:
 
     async def server_health(self) -> dict[str, Any]:
         nuclei_binary = shutil.which(self.config.tools.nuclei_path)
+        external_tools = {
+            name: {
+                "enabled": name in self.config.tools.enabled_external_tools,
+                "available": shutil.which(str(getattr(self.config.tools, f"{name}_path")))
+                is not None,
+            }
+            for name in ("amass", "assetfinder", "gau", "subfinder")
+        }
         return {
             "status": "ok",
             "version": __version__,
@@ -2166,6 +3800,7 @@ class SecurityTools:
                 "enabled": self.config.tools.enable_nuclei,
                 "available": nuclei_binary is not None,
             },
+            "external_tools": external_tools,
             "storage": {
                 "data_dir": str(self.config.output.data_dir),
                 "output_dir": str(self.config.output.output_dir),

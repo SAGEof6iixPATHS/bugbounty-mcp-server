@@ -34,9 +34,10 @@ _GUIDES = {
 
 1. Configure the program's exact authorized scope in `ALLOWED_TARGETS`.
 2. Use `batch_scope_check` before planning network activity.
-3. Start with passive DNS, email-security, TLS, HTTP-header, security.txt, and OpenAPI checks.
-4. Keep crawling, path discovery, port scanning, and Nuclei within the program's rate and
-   testing rules.
+3. Start with local analyzers, passive DNS/email/asset discovery, HTTP metadata, security.txt, and
+   API discovery.
+4. Keep crawling, path discovery, GraphQL introspection, port scanning, and Nuclei within the
+   program's rate and testing rules.
 5. Confirm impact manually before creating a finding. Attach concise, redacted evidence and
    record remediation.
 6. Export Markdown for humans or SARIF/JSON for automation.
@@ -107,9 +108,62 @@ explicitly enabled.
 
 HTTP connections use the validated DNS answer, redirects are re-authorized, direct TCP/TLS
 connections use pinned numeric addresses, and each tool enforces independent request,
-concurrency, size, and runtime limits. External scanners remain optional and are launched with
-restricted redirects, local-network access, interaction services, rates, concurrency, response
-sizes, and stdin.
+concurrency, size, and runtime limits. External tools remain optional, use argv-only subprocesses,
+and have runtime/output bounds. Returned passive assets are rechecked against configured scope.
+""",
+    ),
+    "bugbounty://guides/web-assessment": (
+        "Bounded web assessment",
+        """# Bounded web assessment
+
+1. Start with `http_probe` or `batch_http_probe` and retain metadata, not response bodies.
+2. Correlate headers, CSP, cookies, CORS, caching, SRI, and technology signals. A missing header is
+   not automatically a vulnerability.
+3. Inventory robots, sitemaps, metadata, scripts, source maps, and same-host pages within program
+   request limits.
+4. Use `sensitive_file_exposure_scan` and `http_method_analysis` as candidate generators only;
+   generic WAF/error responses create false positives.
+5. Manually reproduce the smallest security-boundary failure before creating a finding.
+""",
+    ),
+    "bugbounty://guides/api-assessment": (
+        "API and identity assessment",
+        """# API and identity assessment
+
+- Use `openapi_discovery` for bounded retrieval and `openapi_security_analysis` for supplied
+  documents. Unauthenticated operations in a schema require access-control verification.
+- Use OAuth/OIDC discovery to inventory issuer endpoints, grants, response types, JWKS, and PKCE.
+  Do not send credentials or tokens to discovery tools.
+- GraphQL discovery sends only read-only GET queries. Introspection availability is an exposure
+  signal whose impact depends on program policy and authorization controls.
+- Analyze JWTs locally; decoding never verifies a signature. Validate issuer, audience, algorithm,
+  key selection, time claims, and signature in the actual application trust context.
+""",
+    ),
+    "bugbounty://guides/dns-asset-discovery": (
+        "DNS and asset discovery",
+        """# DNS and asset discovery
+
+Correlate conventional DNS records, email controls, DNSSEC publication, certificate transparency,
+wildcard answers, and CNAME resolution. DNSSEC publication is not a full chain validation.
+Unresolved CNAMEs are not proof that a third-party service can be claimed.
+
+Generated typo domains are never resolved or treated as in scope. Passive external adapters are
+disabled by default and every returned hostname/URL is scope filtered. Newly discovered assets
+still require confirmation against the authoritative bounty program scope.
+""",
+    ),
+    "bugbounty://guides/external-integrations": (
+        "External tool integrations",
+        """# External tool integrations
+
+Nuclei, Subfinder, passive Amass, Assetfinder, and gau are installed separately and disabled by
+default. Enable only reviewed binaries. Subprocesses use argv execution without a shell and have
+closed stdin, runtime limits, output limits, and process-group cleanup.
+
+Passive provider tools disclose the queried domain to their configured sources. Review program
+rules, provider terms, credentials, binary provenance, and update practices. The server filters
+returned assets against scope, but cannot audit an external binary's internal behavior.
 """,
     ),
 }
@@ -333,11 +387,13 @@ class MCPKnowledgeCatalog:
             description = "Authorized assessment planning workflow"
         elif name == "passive-recon":
             text = (
-                f"For authorized target {target}, call scope_check and then use DNS, "
-                "email-security, TLS, HTTP metadata, headers, cookie, security.txt, and OpenAPI "
-                "tools. Correlate the results, label uncertainty, and ask before moving to "
-                "crawling, path discovery, port "
-                "scanning, or Nuclei if the supplied program rules do not clearly permit them."
+                f"For authorized target {target}, call scope_check and then use local URL/domain "
+                "analysis, DNS and email-security posture, certificate transparency, TLS, HTTP "
+                "metadata, web "
+                "policy, security.txt, and API discovery tools. Use passive CLI adapters only if "
+                "the operator enabled them and program rules permit their providers. Correlate "
+                "results, label uncertainty, and ask before crawling, path discovery, GraphQL "
+                "introspection, port scanning, or Nuclei."
             )
             description = "Passive-first reconnaissance workflow"
         else:

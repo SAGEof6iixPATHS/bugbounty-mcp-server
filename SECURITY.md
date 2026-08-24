@@ -40,7 +40,8 @@ logs contain the tool name, not raw arguments that may contain evidence or token
 
 ### Network targets
 
-Network content, redirects, certificates, DNS records, headers, and Nuclei output are untrusted.
+Network content, redirects, certificates, DNS records, headers, passive-provider output, and Nuclei
+output are untrusted.
 Response bodies are bounded and not returned by `http_probe`. HTML is parsed for inventory only and
 is never rendered by the server. Report HTML escapes finding content.
 
@@ -74,6 +75,17 @@ Nuclei is disabled by default. When enabled:
 
 Installed templates remain part of the trust boundary. Review and pin them according to your program's
 rules and traffic limits.
+
+Subfinder, passive Amass, Assetfinder, and gau are also disabled by default. Enabling one authorizes
+the server to invoke the configured binary and disclose the queried domain to its data sources. The
+server passes argv without a shell, bounds runtime/output, rejects non-domain noise, and rechecks
+every returned subdomain or URL against scope. External tool configuration, provider credentials,
+provider behavior, binary provenance, and upstream terms remain operator trust boundaries.
+
+The local `secret_pattern_analysis` tool returns only type, location, length, and a shortened
+SHA-256 fingerprint. It never returns matched credential values. Supplied content can still reach
+the MCP client/server process boundary, so callers should minimize sensitive input and use a local
+stdio deployment for incident-response material.
 
 ## Transport security
 

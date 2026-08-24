@@ -33,6 +33,6 @@ CMD ["serve"]
 
 LABEL org.opencontainers.image.title="BugBounty MCP Server" \
       org.opencontainers.image.description="Scope-safe MCP server for authorized bug bounty work" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.source="https://github.com/gokulapap/bugbounty-mcp-server" \
       org.opencontainers.image.licenses="MIT"
